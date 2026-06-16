@@ -1,0 +1,46 @@
+name: Deploy YOLO
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Dev instance
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEV_INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ secrets.DEV_INSTANCE_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/PolyAI
+            git reset --hard  
+            git pull origin dev
+            source .venv/bin/activate
+            pip install -r services/yolo/requirements.txt
+            pip install -r services/yolo/torch-requirements.txt
+            sudo systemctl restart yolo.service
+
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Prod instance
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ secrets.PROD_INSTANCE_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/PolyAI
+            git reset --hard
+            git pull origin main
+            source .venv/bin/activate
+            pip install -r services/yolo/requirements.txt
+            pip install -r services/yolo/torch-requirements.txt
+            sudo systemctl restart yolo.service
