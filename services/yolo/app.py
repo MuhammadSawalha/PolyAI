@@ -120,8 +120,7 @@ def predict(file: UploadFile = File(...)):
     with open(original_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Run the AI Model on the CPU
-    results = model(original_path, device="cpu")
+    results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
     # Draw the bounding boxes and save the new annotated image
     annotated_frame = results[0].plot()  # NumPy array
