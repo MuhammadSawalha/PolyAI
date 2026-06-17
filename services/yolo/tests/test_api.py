@@ -2,6 +2,7 @@ import os
 import pytest
 import sqlite3
 import importlib
+import signal
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -231,3 +232,38 @@ def test_get_predictions_by_score_out_of_bounds(client):
     response = client.get("/predictions/score/1.1")
     assert response.status_code == 400
     assert response.json()["detail"] == "min_score must be between 0.0 and 1.0"
+
+
+# ====================================================================================
+# Graceful Shutdown & Readiness Tests
+# ====================================================================================
+
+def test_ready_endpoint_healthy(client):
+    """Test that the /ready endpoint returns 200 when the server is healthy."""
+    # Force the state to False to simulate normal operations
+    app_module.is_shutting_down = False
+    
+    response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+def test_ready_endpoint_shutting_down(client):
+    """Test that /ready returns 503 Service Unavailable during a shutdown sequence."""
+    # Mock the global variable state to simulate a shutdown in progress
+    with patch("app.is_shutting_down", True):
+        response = client.get("/ready")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Service is shutting down"
+
+
+def test_sigterm_handler_execution():
+    """Test that the SIGTERM handler cleans up and exits cleanly."""
+    # We use pytest.raises(SystemExit) because sys.exit(0) raises a SystemExit exception
+    with pytest.raises(SystemExit) as exit_info:
+        # Call the handler manually to simulate Linux passing a SIGTERM signal
+        app_module.handle_sigterm(signal.SIGTERM, None)
+        
+    # Verify it exits with code 0 (clean shutdown) and flips the boolean state
+    assert exit_info.value.code == 0
+    assert app_module.is_shutting_down is True
