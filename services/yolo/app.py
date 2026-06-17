@@ -9,7 +9,10 @@ import os
 import uuid
 import shutil
 import time
+import signal
+import sys
 
+is_shutting_down = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -73,6 +76,16 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label ON detection_objects (label)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_score ON detection_objects (score)")
 
+
+def handle_sigterm(signum, frame):
+    global is_shutting_down
+    is_shutting_down = True
+    logging.info("Received SIGTERM. Shutting down gracefully...")
+    # Perform cleanup: close DB connections, finish pending work, etc.
+    logging.info("Cleanup done. Exiting.")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 def save_prediction_session(uid, original_image, predicted_image):
     """
@@ -274,6 +287,13 @@ def get_predictions_by_score(min_score: float):
                 "box": obj["box"]
             } for obj in objects_rows
         ]
+
+
+@app.get("/ready")
+def ready():
+    if is_shutting_down:
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+    return {"status": "ready"}
 
 
 @app.get("/health")
