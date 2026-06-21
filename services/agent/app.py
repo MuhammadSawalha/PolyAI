@@ -31,6 +31,7 @@ MODEL = os.environ.get("MODEL")
 ALLOWED_MODELS = {
     "openai:gpt-5.4-mini",
     "anthropic:claude-haiku-4-5",
+    "google:gemini-2.5-flash",
 }
 
 if MODEL not in ALLOWED_MODELS:
@@ -100,7 +101,7 @@ app = FastAPI(title="Vision Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://sawalha.dev.fursa.click:3000"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
