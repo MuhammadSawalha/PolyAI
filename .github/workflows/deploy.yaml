@@ -1,4 +1,4 @@
-name: Deploy YOLO
+name: Deploy PolyAI Services
 
 on:
   push:
@@ -21,10 +21,29 @@ jobs:
             cd /home/ubuntu/PolyAI
             git reset --hard  
             git pull origin dev
+            
+            # 🐍 1. Update Python Virtual Environment Dependencies
             source .venv/bin/activate
             pip install -r services/yolo/requirements.txt
             pip install -r services/yolo/torch-requirements.txt
+            pip install -r services/agent/requirements.txt
+            
+            # 🛠️ 2. Check and Install Node.js/npm dynamically if missing
+            if ! command -v npm &> /dev/null; then
+              echo "⚠️ npm not found! Installing Node.js 20 natively..."
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+            
+            # 📦 3. Install and Build Frontend Dependencies
+            cd services/frontend
+            npm install
+            npm run build
+            
+            # 🚀 4. Restart All Background System Services
             sudo systemctl restart yolo.service
+            sudo systemctl restart agent.service
+            sudo systemctl restart frontend.service
 
   deploy-prod:
     if: github.ref == 'refs/heads/main'
@@ -40,7 +59,26 @@ jobs:
             cd /home/ubuntu/PolyAI
             git reset --hard
             git pull origin main
+            
+            # 🐍 1. Update Python Virtual Environment Dependencies
             source .venv/bin/activate
             pip install -r services/yolo/requirements.txt
             pip install -r services/yolo/torch-requirements.txt
+            pip install -r services/agent/requirements.txt
+            
+            # 🛠️ 2. Check and Install Node.js/npm dynamically if missing
+            if ! command -v npm &> /dev/null; then
+              echo "⚠️ npm not found! Installing Node.js 20 natively..."
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+            
+            # 📦 3. Install and Build Frontend Dependencies
+            cd services/frontend
+            npm install
+            npm run build
+            
+            # 🚀 4. Restart All Background System Services
             sudo systemctl restart yolo.service
+            sudo systemctl restart agent.service
+            sudo systemctl restart frontend.service
