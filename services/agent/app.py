@@ -31,7 +31,7 @@ MODEL = os.environ.get("MODEL")
 ALLOWED_MODELS = {
     "openai:gpt-5.4-mini",
     "anthropic:claude-haiku-4-5",
-    "google:gemini-2.5-flash",
+    "google_genai:gemini-2.5-flash",
 }
 
 if MODEL not in ALLOWED_MODELS:
@@ -73,35 +73,46 @@ TOOLS = {
 llm = init_chat_model(MODEL, temperature=0)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
-def run_agent(history: list) -> str:
+def run_agent(history: list, max_iterations: int = 10) -> str:
     """
-    Simple ReAct loop:
+    Simple ReAct loop with an infinite loop safety guard:
       1. Send messages to the LLM.
       2. If the LLM requests tool calls, execute them and append results.
-      3. Repeat until the LLM returns a plain text response.
+      3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + history
+    iterations = 0
 
-    while True:
+    while iterations < max_iterations:
+        iterations += 1
+        logging.info(f"🤖 Agent iteration {iterations}/{max_iterations}")
+
         response: AIMessage = llm_with_tools.invoke(messages)
         messages.append(response)
 
-        # No tool calls, the model produced its final answer
+        # No tool calls: the model produced its final answer cleanly
         if not response.tool_calls:
             return response.content
 
         # Execute every tool the model requested
         for tool_call in response.tool_calls:
             tool_fn = TOOLS[tool_call["name"]]
-            tool_result = tool_fn.invoke(tool_call)          # returns a ToolMessage
+            tool_result = tool_fn.invoke(tool_call)  # returns a ToolMessage
             messages.append(tool_result)
+            
+    # If the loop breaks because it hit the ceiling instead of stopping naturally:
+    error_msg = f"⚠️ Agent stopped automatically: Reached safety limit of {max_iterations} iterations without resolving."
+    logging.warning(error_msg)
+    return error_msg
 
 
 app = FastAPI(title="Vision Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://sawalha.dev.fursa.click:3000"],
+    allow_origins=["http://localhost:3000", 
+                   "http://sawalha.dev.fursa.click:3000" ,
+                   "http://sawalha.prod.fursa.click:3000"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
@@ -139,7 +150,25 @@ def chat(request: ChatRequest):
 
     token = _current_image_b64.set(latest_image)
     try:
-        return ChatResponse(response=run_agent(lc_messages))
+        # 1. Capture the raw answer coming from your agent ReAct loop
+        agent_output = run_agent(lc_messages)
+        
+        # 2. Check if the output is a list (blocks Pydantic parsing) and clean it up
+        if isinstance(agent_output, list):
+            # Extract and join all plain text blocks found inside the list structure
+            clean_text = ""
+            for block in agent_output:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    clean_text += block.get("text", "")
+                elif isinstance(block, str):
+                    clean_text += block
+            final_response = clean_text if clean_text else str(agent_output)
+        else:
+            # It's already a regular clean string
+            final_response = str(agent_output)
+
+        return ChatResponse(response=final_response)
+        
     finally:
         _current_image_b64.reset(token)
 
