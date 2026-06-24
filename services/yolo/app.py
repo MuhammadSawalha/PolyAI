@@ -11,6 +11,14 @@ import shutil
 import time
 import signal
 import sys
+from pydantic import BaseModel
+from typing import List, Optional
+
+class YoloPredictResponse(BaseModel):
+    prediction_uid: str
+    detection_count: int
+    labels: List[str]
+    time_took: float
 
 is_shutting_down = False
 
@@ -107,7 +115,7 @@ def save_detection_object(prediction_uid, label, score, box):
             VALUES (?, ?, ?, ?)
         """, (prediction_uid, label, score, str(box)))
 
-@app.post("/predict")
+@app.post("/predict", response_model=YoloPredictResponse)
 def predict(file: UploadFile = File(...)):
     """
     Predict objects in an image, validate file format, and track processing time
@@ -156,12 +164,11 @@ def predict(file: UploadFile = File(...)):
     # Stop the stopwatch and calculate total runtime in seconds
     processing_time = round(time.time() - start_time, 2)
 
-    # Return the complete JSON packet back to the client
     return {
         "prediction_uid": uid,
         "detection_count": len(results[0].boxes),
         "labels": detected_labels,
-        "time_took": processing_time
+        "time_took": processing_time,
     }
 
 @app.get("/prediction/{uid}")
