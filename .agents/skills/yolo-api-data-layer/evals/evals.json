@@ -1,0 +1,210 @@
+{
+  "evals": [
+    {
+      "name": "db-module-creation",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "Creates services/yolo/db.py with SQLAlchemy engine, SessionLocal, Base, and get_db() dependency injection function for FastAPI. Supports both SQLite (default) and PostgreSQL via DB_URL environment variable.",
+      "assertions": [
+        "File services/yolo/db.py is created",
+        "Imports SQLAlchemy: create_engine, sessionmaker, declarative_base",
+        "Reads DB_URL from environment with default 'sqlite:///./predictions.db'",
+        "Creates SQLite engine with 'check_same_thread': False in connect_args",
+        "Creates SessionLocal with sessionmaker(autocommit=False, autoflush=False, bind=engine)",
+        "Defines Base = declarative_base() for model inheritance",
+        "Defines get_db() generator function that yields db session",
+        "get_db() closes session in finally block for proper cleanup",
+        "No hardcoded database paths - uses environment variable",
+        "Supports both SQLite and PostgreSQL connection strings"
+      ]
+    },
+    {
+      "name": "models-module-creation",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "Creates services/yolo/models.py defining PredictionSession and DetectionObject ORM models that map to database tables with proper relationships, constraints, and indices for query optimization.",
+      "assertions": [
+        "File services/yolo/models.py is created",
+        "PredictionSession class inherits from Base",
+        "PredictionSession has __tablename__ = 'prediction_sessions'",
+        "PredictionSession.uid is String column with primary_key=True",
+        "PredictionSession.timestamp is DateTime column with UTC default",
+        "PredictionSession has original_image and predicted_image String columns",
+        "PredictionSession defines relationship to DetectionObject",
+        "DetectionObject class inherits from Base",
+        "DetectionObject has __tablename__ = 'detection_objects'",
+        "DetectionObject.id is Integer column with primary_key=True and autoincrement",
+        "DetectionObject.prediction_uid is String with ForeignKey to prediction_sessions.uid",
+        "DetectionObject has label, score, and box columns with appropriate types",
+        "DetectionObject defines back_populates relationship to PredictionSession",
+        "DetectionObject has indices on prediction_uid, label, and score columns",
+        "No raw SQL CREATE TABLE statements - pure ORM declarative syntax"
+      ]
+    },
+    {
+      "name": "app-imports-and-db-init",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "Updates services/yolo/app.py to remove sqlite3 dependency and import SQLAlchemy modules, models, and database configuration. Replaces init_db() SQL with Base.metadata.create_all().",
+      "assertions": [
+        "Does NOT import sqlite3 module",
+        "Adds 'from sqlalchemy.orm import Session' to imports",
+        "Adds 'Depends' to FastAPI imports",
+        "Imports 'from db import engine, Base, get_db'",
+        "Imports 'from models import PredictionSession, DetectionObject'",
+        "Removes DB_PATH global variable",
+        "Removes init_db() function definition with raw SQL CREATE TABLE",
+        "Replaces init_db() call with Base.metadata.create_all(bind=engine)",
+        "Keeps all other business logic unchanged (YOLO model, file handling, etc)",
+        "No hardcoded SQL strings in app.py"
+      ]
+    },
+    {
+      "name": "endpoint-dependency-injection",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "All database endpoints in services/yolo/app.py accept db: Session = Depends(get_db) parameter for dependency injection instead of creating database connections inside the handler.",
+      "assertions": [
+        "POST /predict endpoint signature includes db: Session = Depends(get_db)",
+        "GET /prediction/{uid} endpoint signature includes db: Session = Depends(get_db)",
+        "GET /prediction/{uid}/image endpoint signature includes db: Session = Depends(get_db)",
+        "GET /predictions/label/{label} endpoint signature includes db: Session = Depends(get_db)",
+        "GET /predictions/score/{min_score} endpoint signature includes db: Session = Depends(get_db)",
+        "No sqlite3.connect() calls exist anywhere in endpoint implementations",
+        "No try/except with sqlite3.connect in finally blocks",
+        "save_prediction_session() helper accepts db: Session as first parameter",
+        "save_detection_object() helper accepts db: Session as first parameter",
+        "Endpoints call helpers with db parameter: save_prediction_session(db, ...)"
+      ]
+    },
+    {
+      "name": "database-operations-orm-transformation",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "All database operations in services/yolo/app.py use SQLAlchemy ORM queries instead of raw SQL. Object data accessed via dot notation. Relationships use ORM attributes instead of manual JOINs.",
+      "assertions": [
+        "save_prediction_session() creates PredictionSession ORM instance",
+        "save_prediction_session() uses db.add(session) and db.commit()",
+        "save_detection_object() creates DetectionObject ORM instance",
+        "save_detection_object() uses db.add(obj) and db.commit()",
+        "SELECT queries use db.query(PredictionSession).filter_by(...).first()",
+        "SELECT queries use db.query(DetectionObject).filter_by(...).all()",
+        "No raw SQL strings like 'SELECT * FROM' in app.py",
+        "No row['column'] dict-style access - uses obj.column attribute access",
+        "get_prediction_by_uid uses session.detection_objects relationship instead of JOIN",
+        "get_predictions_by_label uses db.query().join() with filter instead of manual JOIN query",
+        "Access to ORM objects uses attributes: session.uid, obj.label, obj.score",
+        "No conn.row_factory = sqlite3.Row pattern"
+      ]
+    },
+    {
+      "name": "test-fixtures-file-based-database",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "Test fixtures in services/yolo/tests/test_api.py use file-based SQLite database (not in-memory) to enable proper TestClient thread sharing. All fixtures depend on a single test_engine to prevent database isolation bugs.",
+      "assertions": [
+        "test_engine fixture exists with function scope",
+        "test_engine uses tempfile.mkstemp() to create temporary database file",
+        "test_engine creates engine with f'sqlite:///{db_path}' URL (file-based, not :memory:)",
+        "test_engine sets 'check_same_thread': False in connect_args",
+        "test_engine calls Base.metadata.create_all(bind=engine)",
+        "test_engine yields engine for other fixtures to use",
+        "test_engine cleans up with Base.metadata.drop_all() and os.unlink()",
+        "setup_db fixture has autouse=True",
+        "setup_db(test_engine) depends on test_engine parameter",
+        "setup_db creates TestingSessionLocal from test_engine (shared database)",
+        "setup_db overrides app.dependency_overrides[get_db] with test session factory",
+        "setup_db clears overrides after test with app.dependency_overrides.clear()",
+        "db_session fixture depends on test_engine parameter",
+        "db_session(test_engine) creates session from same engine as setup_db",
+        "No create_engine() calls inside test functions - only via fixtures",
+        "No use of sqlite:///:memory: in test code",
+        "TestClient uses app with injected test database via dependency_overrides"
+      ]
+    },
+    {
+      "name": "test-orm-access-patterns",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "Test code in services/yolo/tests/test_api.py uses ORM for all database operations. Imports ORM models and get_db. Helper functions accept db: Session and use ORM. Assertions access object attributes not dict keys.",
+      "assertions": [
+        "Imports get_db from app module",
+        "Imports PredictionSession and DetectionObject from models module",
+        "Imports Base from db module",
+        "Does NOT import sqlite3",
+        "save_prediction_session(db, ...) helper accepts db: Session parameter",
+        "save_prediction_session helper creates PredictionSession() ORM instance",
+        "save_prediction_session helper uses db.add(session) and db.commit()",
+        "save_detection_object(db, ...) helper accepts db: Session parameter",
+        "save_detection_object helper creates DetectionObject() ORM instance",
+        "Test assertions use db.query(PredictionSession).filter_by(...).first()",
+        "Test assertions access row.uid not row['uid']",
+        "Test assertions access obj.label not obj['label']",
+        "Test assertions access obj.score not obj['score']",
+        "No direct sqlite3.connect() in test implementations",
+        "Tests that seed data pass db_session fixture to helper functions"
+      ]
+    },
+    {
+      "name": "api-contracts-preserved",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "All HTTP API contracts remain unchanged after SQLAlchemy migration. Routes, methods, status codes, response schemas, and validation remain identical to original sqlite3 version.",
+      "assertions": [
+        "POST /predict endpoint exists with YoloPredictResponse model",
+        "YoloPredictResponse has fields: prediction_uid, detection_count, labels, time_took",
+        "GET /prediction/{uid} endpoint returns correct response structure",
+        "GET /prediction/{uid}/image endpoint returns FileResponse",
+        "GET /predictions/label/{label} endpoint returns list of predictions",
+        "GET /predictions/score/{min_score} endpoint returns list of detection objects",
+        "GET /health endpoint returns {'status': 'ok'}",
+        "GET /ready endpoint returns {'status': 'ready'}",
+        "POST /predict returns status 200 on success",
+        "POST /predict returns status 400 for invalid file extension",
+        "GET /prediction/{uid} returns status 404 when prediction not found",
+        "GET /prediction/{uid}/image returns status 404 when image not found",
+        "GET /predictions/label/{label} returns status 400 for empty label",
+        "GET /predictions/score/{min_score} returns status 400 for score out of bounds (0.0-1.0)",
+        "GET /ready returns status 503 when is_shutting_down is True",
+        "All validation rules preserved from original: label.strip(), min_score bounds check",
+        "YOLO model inference logic unchanged: model(image_path, device='cpu', conf=CONFIDENCE_THRESHOLD)",
+        "CONFIDENCE_THRESHOLD environment variable handling preserved",
+        "Image file processing logic unchanged"
+      ]
+    },
+    {
+      "name": "predict-endpoint-orm-integration",
+      "prompt": "Write reliable tests for POST /predict after the SQLAlchemy refactor. Tests must not load the real YOLO model and must not touch a developer database.",
+      "expected_output": "The POST /predict endpoint is fully integrated with SQLAlchemy ORM, accepting a db session via FastAPI dependency injection, storing prediction and detection data in test database, and mocking only the YOLO model boundary.",
+      "assertions": [
+        "Uses FastAPI TestClient to call POST /predict",
+        "Mocks YOLO model instead of loading real model (yolov8n.pt)",
+        "Injects isolated test database via app.dependency_overrides[get_db]",
+        "Does NOT create or read real predictions.db file",
+        "Calls save_prediction_session(db, uid, original_path, predicted_path) with injected db",
+        "Calls save_detection_object(db, uid, label, score, bbox) for each detected object",
+        "Saves PredictionSession and DetectionObject records to test database",
+        "Test assertions read back data using db.query(PredictionSession).filter_by(uid=...).first()",
+        "Test assertions verify detection_objects relationship populated correctly",
+        "Mocked model.names dict contains labels",
+        "Mocked box.cls, box.conf, box.xyxy tensors return expected values",
+        "Test passes with only YOLO model mocked - real database and filesystem not involved in data validation"
+      ]
+    },
+    {
+      "name": "no-sqlite3-raw-sql-anywhere",
+      "prompt": "use the yolo-api-data-layer skill to refactor the api to work with sqlalchemy",
+      "expected_output": "No raw SQL strings or sqlite3 module usage remains anywhere in the refactored codebase. All database operations go through SQLAlchemy ORM.",
+      "assertions": [
+        "No 'import sqlite3' in app.py",
+        "No 'import sqlite3' in tests/test_api.py",
+        "No sqlite3.connect() calls anywhere",
+        "No 'SELECT * FROM' or similar raw SQL strings in app.py",
+        "No 'INSERT INTO' or similar raw SQL strings in app.py",
+        "No conn.execute() calls with SQL strings",
+        "No conn.row_factory = sqlite3.Row",
+        "No CREATE TABLE statements with raw SQL",
+        "No string interpolation like f'SELECT ... WHERE uid = {uid}'",
+        "All queries use db.query() ORM interface",
+        "All inserts use db.add() and db.commit()",
+        "Database initialization uses Base.metadata.create_all(bind=engine)",
+        "grep 'sqlite3' on services/yolo/app.py returns no results",
+        "grep 'sqlite3' on services/yolo/tests/test_api.py returns no results",
+        "grep 'SELECT' on services/yolo/app.py returns no results (no raw SQL)",
+        "grep 'INSERT' on services/yolo/app.py returns no results (no raw SQL)"
+      ]
+    }
+  ]
+}

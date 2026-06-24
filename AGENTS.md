@@ -80,3 +80,20 @@ result = create_react_agent(llm, tools).invoke(state)
 ### Do not use high-level agent frameworks as a black box
 `create_react_agent`, `AgentExecutor`, and similar wrappers hide the loop that students need to learn.
 Implement the ReAct loop manually in `run_agent()` inside `services/agent/app.py`.
+
+
+---
+
+## 🧠 Agent Skills & Evaluations Workflow
+
+This project utilizes a structured **Agent Skills** architecture to handle systematic refactoring and feature additions safely. 
+
+### 📂 Location and Loading
+* Skills are stored in `.agents/skills/<skill-name>/SKILL.md`.
+* Before performing any task related to a skill's description (e.g., modifying the YOLO data layer), read the associated `SKILL.md` completely.
+* Adhere strictly to the architectural rules, file layouts, and constraints specified inside the skill instructions.
+
+### 🧪 Evaluation Driven Development
+* Automated test cases and mock expectations for skills reside in `.agents/skills/<skill-name>/evals/evals.json`.
+* Do not make arbitrary design decisions. Ensure the generated code perfectly matches the `expected_output` requirements defined in the evaluation suite.
+* Maintain existing endpoint routes, HTTP status codes, and structural validation payloads intact to prevent breaking downstream components.

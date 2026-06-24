@@ -3,6 +3,10 @@ fastapi>=0.95.0
 uvicorn>=0.21.1
 httpx>=0.28.1
 
+# Database ORM
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+
 # Pillow for image handling
 pillow>=9.5.0
 
