@@ -3,8 +3,9 @@ import io
 import json
 import logging
 import os
+import time
 from contextvars import ContextVar
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -46,7 +47,63 @@ SYSTEM_PROMPT = (
     "Use the available tools to extract information from images. "
 )
 
+
+class AgentChatResponse(BaseModel):
+    response: str
+    prediction_id: Optional[str] = None
+    annotated_image: Optional[str] = None
+    agent_loop_time_s: float
+    iterations: int
+    tools_called: List[str]
+    context_limit_exceeded: bool
+
+
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
+
+
+def _normalize_response_content(content) -> str:
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts) if parts else str(content)
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+def _extract_prediction_id(tool_output: object) -> Optional[str]:
+    if isinstance(tool_output, str):
+        try:
+            payload = json.loads(tool_output)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(tool_output, dict):
+        payload = tool_output
+    else:
+        return None
+
+    if isinstance(payload, dict):
+        return payload.get("prediction_uid") or payload.get("prediction_id")
+    return None
+
+
+def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
+    if not prediction_id:
+        return None
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(f"{YOLO_SERVICE_URL}/prediction/{prediction_id}/image")
+            response.raise_for_status()
+        return base64.b64encode(response.content).decode("ascii")
+    except Exception as exc:
+        logging.warning("Failed to fetch annotated image for %s: %s", prediction_id, exc)
+        return None
+
 
 @tool
 def detect_objects() -> str:
@@ -73,7 +130,7 @@ TOOLS = {
 llm = init_chat_model(MODEL, temperature=0)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
-def run_agent(history: list, max_iterations: int = 10) -> str:
+def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
     Simple ReAct loop with an infinite loop safety guard:
       1. Send messages to the LLM.
@@ -82,6 +139,10 @@ def run_agent(history: list, max_iterations: int = 10) -> str:
     """
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + history
     iterations = 0
+    tools_called: List[str] = []
+    prediction_id: Optional[str] = None
+    annotated_image: Optional[str] = None
+    start_time = time.perf_counter()
 
     while iterations < max_iterations:
         iterations += 1
@@ -90,20 +151,45 @@ def run_agent(history: list, max_iterations: int = 10) -> str:
         response: AIMessage = llm_with_tools.invoke(messages)
         messages.append(response)
 
-        # No tool calls: the model produced its final answer cleanly
         if not response.tool_calls:
-            return response.content
+            loop_time = round(time.perf_counter() - start_time, 4)
+            return {
+                "response": _normalize_response_content(response.content),
+                "prediction_id": prediction_id,
+                "annotated_image": annotated_image,
+                "agent_loop_time_s": loop_time,
+                "iterations": iterations,
+                "tools_called": tools_called,
+                "context_limit_exceeded": False,
+            }
 
-        # Execute every tool the model requested
         for tool_call in response.tool_calls:
-            tool_fn = TOOLS[tool_call["name"]]
-            tool_result = tool_fn.invoke(tool_call)  # returns a ToolMessage
+            tool_name = tool_call.get("name")
+            tool_fn = TOOLS[tool_name]
+            tool_result = tool_fn.invoke(tool_call)
+            tool_output = tool_result.content if hasattr(tool_result, "content") else str(tool_result)
+            if not hasattr(tool_result, "content"):
+                tool_result = ToolMessage(content=tool_output, tool_call_id=tool_call.get("id", ""))
             messages.append(tool_result)
-            
-    # If the loop breaks because it hit the ceiling instead of stopping naturally:
+            if tool_name:
+                tools_called.append(tool_name)
+            if tool_name == "detect_objects":
+                prediction_id = _extract_prediction_id(tool_output)
+                if prediction_id:
+                    annotated_image = _fetch_annotated_image(prediction_id)
+
+    loop_time = round(time.perf_counter() - start_time, 4)
     error_msg = f"⚠️ Agent stopped automatically: Reached safety limit of {max_iterations} iterations without resolving."
     logging.warning(error_msg)
-    return error_msg
+    return {
+        "response": error_msg,
+        "prediction_id": prediction_id,
+        "annotated_image": annotated_image,
+        "agent_loop_time_s": loop_time,
+        "iterations": iterations,
+        "tools_called": tools_called,
+        "context_limit_exceeded": True,
+    }
 
 
 app = FastAPI(title="Vision Agent")
@@ -128,11 +214,7 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]         # full conversation thread, oldest first
 
 
-class ChatResponse(BaseModel):
-    response: str
-
-
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=AgentChatResponse)
 def chat(request: ChatRequest):
     lc_messages = []
     latest_image = None
@@ -150,25 +232,8 @@ def chat(request: ChatRequest):
 
     token = _current_image_b64.set(latest_image)
     try:
-        # 1. Capture the raw answer coming from your agent ReAct loop
-        agent_output = run_agent(lc_messages)
-        
-        # 2. Check if the output is a list (blocks Pydantic parsing) and clean it up
-        if isinstance(agent_output, list):
-            # Extract and join all plain text blocks found inside the list structure
-            clean_text = ""
-            for block in agent_output:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    clean_text += block.get("text", "")
-                elif isinstance(block, str):
-                    clean_text += block
-            final_response = clean_text if clean_text else str(agent_output)
-        else:
-            # It's already a regular clean string
-            final_response = str(agent_output)
-
-        return ChatResponse(response=final_response)
-        
+        agent_payload = run_agent(lc_messages)
+        return agent_payload
     finally:
         _current_image_b64.reset(token)
 
