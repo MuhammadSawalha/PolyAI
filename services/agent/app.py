@@ -73,10 +73,8 @@ class AgentChatResponse(BaseModel):
     context_limit_exceeded: bool
     tokens_used: TokenUsage  # Added token usage
 
-
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
 _current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
-
 
 def _normalize_response_content(content) -> str:
     if isinstance(content, list):
@@ -90,7 +88,6 @@ def _normalize_response_content(content) -> str:
     if isinstance(content, str):
         return content
     return str(content)
-
 
 def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
     if not prediction_id:
@@ -113,12 +110,10 @@ def show_annotated_image() -> str:
     Requires a successful prior execution of detect_objects to provide a valid tracking UID.
     """
     prediction_uid = _current_prediction_id.get()
-
     if not prediction_uid:
         return json.dumps({
             "error": "No object detection has been performed yet in this session. Run detect_objects first."
         })
-
     image_url = f"{YOLO_SERVICE_URL}/prediction/{prediction_uid}/image"
     return json.dumps({"image_url": image_url})
 
@@ -137,7 +132,6 @@ def detect_objects() -> str:
         )
         response.raise_for_status()
     return json.dumps(response.json())
-
 
 # Registry: map tool name -> tool function
 TOOLS = {
