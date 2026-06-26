@@ -33,6 +33,10 @@ ALLOWED_MODELS = {
     "openai:gpt-5.4-mini",
     "anthropic:claude-haiku-4-5",
     "google_genai:gemini-2.5-flash",
+    "amazon.nova-lite-v1:0",
+    "openai.gpt-oss-20b-1:0",
+    "meta.llama3-1-8b-instruct-v1:0",
+    "amazon.nova-micro-v1:0",
 }
 
 if MODEL not in ALLOWED_MODELS:
@@ -43,8 +47,14 @@ if MODEL not in ALLOWED_MODELS:
     )
 
 SYSTEM_PROMPT = (
-    "You are an AI vision assistant. You help users understand and analyze images. "
-    "Use the available tools to extract information from images. "
+    "You are an AI vision assistant. You help users analyze images via tools. "
+    "To analyze an image, you must run `detect_objects`, followed by `show_annotated_image` if the user requests to show the annotated image. "
+    "CRITICAL OUTPUT RULES:"
+    "1. If the user did not ask to see the annotated image, do not include it in your response. but you can ask him if he wants to see it. "
+    "2. If the user asked to see the annotated image, do not print raw image URLs just let the image appear directly. "
+    "3. You MUST read the tool output data from `detect_objects` and write a detailed, natural paragraph summary breaking down exactly what items were found. "
+    "4. Do not include raw XML tags like `<thinking>` or `</thinking>` in your text reply. "
+    "if the user said yes for the annotated image, you must include it in your response. not the link, just the image itself. "
 )
 
 
@@ -52,6 +62,7 @@ class AgentChatResponse(BaseModel):
     response: str
     prediction_id: Optional[str] = None
     annotated_image: Optional[str] = None
+    image_url: Optional[str] = None
     agent_loop_time_s: float
     iterations: int
     tools_called: List[str]
@@ -59,6 +70,7 @@ class AgentChatResponse(BaseModel):
 
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
+_current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
 
 
 def _normalize_response_content(content) -> str:
@@ -75,22 +87,6 @@ def _normalize_response_content(content) -> str:
     return str(content)
 
 
-def _extract_prediction_id(tool_output: object) -> Optional[str]:
-    if isinstance(tool_output, str):
-        try:
-            payload = json.loads(tool_output)
-        except json.JSONDecodeError:
-            return None
-    elif isinstance(tool_output, dict):
-        payload = tool_output
-    else:
-        return None
-
-    if isinstance(payload, dict):
-        return payload.get("prediction_uid") or payload.get("prediction_id")
-    return None
-
-
 def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
     if not prediction_id:
         return None
@@ -104,6 +100,22 @@ def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
         logging.warning("Failed to fetch annotated image for %s: %s", prediction_id, exc)
         return None
 
+@tool
+def show_annotated_image() -> str:
+    """Retrieves the public URL of the annotated image containing YOLO bounding boxes.
+
+    Use this tool ONLY when the user explicitly requests to see the visual image or photo.
+    Requires a successful prior execution of detect_objects to provide a valid tracking UID.
+    """
+    prediction_uid = _current_prediction_id.get()
+
+    if not prediction_uid:
+        return json.dumps({
+            "error": "No object detection has been performed yet in this session. Run detect_objects first."
+        })
+
+    image_url = f"{YOLO_SERVICE_URL}/prediction/{prediction_uid}/image"
+    return json.dumps({"image_url": image_url})
 
 @tool
 def detect_objects() -> str:
@@ -124,10 +136,11 @@ def detect_objects() -> str:
 
 # Registry: map tool name -> tool function
 TOOLS = {
-    detect_objects.name: detect_objects
+    detect_objects.name: detect_objects,
+    show_annotated_image.name: show_annotated_image,
 }
 
-llm = init_chat_model(MODEL, temperature=0)
+llm = llm = init_chat_model(MODEL, temperature=0)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
@@ -142,6 +155,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     tools_called: List[str] = []
     prediction_id: Optional[str] = None
     annotated_image: Optional[str] = None
+    image_url = None
     start_time = time.perf_counter()
 
     while iterations < max_iterations:
@@ -157,6 +171,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 "response": _normalize_response_content(response.content),
                 "prediction_id": prediction_id,
                 "annotated_image": annotated_image,
+                "image_url": image_url,
                 "agent_loop_time_s": loop_time,
                 "iterations": iterations,
                 "tools_called": tools_called,
@@ -167,16 +182,29 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
             tool_name = tool_call.get("name")
             tool_fn = TOOLS[tool_name]
             tool_result = tool_fn.invoke(tool_call)
+
             tool_output = tool_result.content if hasattr(tool_result, "content") else str(tool_result)
-            if not hasattr(tool_result, "content"):
-                tool_result = ToolMessage(content=tool_output, tool_call_id=tool_call.get("id", ""))
-            messages.append(tool_result)
+            tool_message = ToolMessage(
+                content=tool_output, 
+                tool_call_id=tool_call.get("id", ""), 
+                name=tool_name
+            )
+
+            messages.append(tool_message)
             if tool_name:
                 tools_called.append(tool_name)
+
             if tool_name == "detect_objects":
-                prediction_id = _extract_prediction_id(tool_output)
-                if prediction_id:
-                    annotated_image = _fetch_annotated_image(prediction_id)
+                tool_data = json.loads(tool_result.content)
+                current_id = tool_data.get("prediction_id") or tool_data.get("prediction_uid")
+                if current_id:
+                    prediction_id = current_id
+                    _current_prediction_id.set(current_id)
+            
+            if tool_name == "show_annotated_image":
+                tool_data = json.loads(tool_result.content)
+                image_url = tool_data.get("image_url") or image_url
+                annotated_image = _fetch_annotated_image(prediction_id) or annotated_image
 
     loop_time = round(time.perf_counter() - start_time, 4)
     error_msg = f"⚠️ Agent stopped automatically: Reached safety limit of {max_iterations} iterations without resolving."
@@ -185,6 +213,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "response": error_msg,
         "prediction_id": prediction_id,
         "annotated_image": annotated_image,
+        "image_url": image_url,
         "agent_loop_time_s": loop_time,
         "iterations": iterations,
         "tools_called": tools_called,
@@ -230,12 +259,14 @@ def chat(request: ChatRequest):
         else:
             lc_messages.append(AIMessage(content=msg.content))
 
-    token = _current_image_b64.set(latest_image)
+    token_img = _current_image_b64.set(latest_image)
+    token_pred = _current_prediction_id.set(None) # Reset local state per request context
     try:
         agent_payload = run_agent(lc_messages)
         return agent_payload
     finally:
-        _current_image_b64.reset(token)
+        _current_image_b64.reset(token_img)
+        _current_prediction_id.reset(token_pred)
 
 
 @app.get("/health")
