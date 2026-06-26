@@ -33,6 +33,7 @@ ALLOWED_MODELS = {
     "openai:gpt-5.4-mini",
     "anthropic:claude-haiku-4-5",
     "google_genai:gemini-2.5-flash",
+    "amazon.nova-lite-v1:0",
 }
 
 if MODEL not in ALLOWED_MODELS:
@@ -48,6 +49,13 @@ SYSTEM_PROMPT = (
 )
 
 
+# --- Schemas ---
+class TokenUsage(BaseModel):
+    input: int
+    output: int
+    total: int
+
+
 class AgentChatResponse(BaseModel):
     response: str
     prediction_id: Optional[str] = None
@@ -55,7 +63,7 @@ class AgentChatResponse(BaseModel):
     agent_loop_time_s: float
     iterations: int
     tools_called: List[str]
-    context_limit_exceeded: bool
+    tokens_used: TokenUsage  # Added token usage
 
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
@@ -127,8 +135,36 @@ TOOLS = {
     detect_objects.name: detect_objects
 }
 
+# Initialize the model dynamically
 llm = init_chat_model(MODEL, temperature=0)
+
+# Capability check
+try:
+    profile = llm.profile or {}
+except Exception:
+    profile = {}
+
+if profile:
+    if not profile.get("tool_calling", False):
+        raise SystemExit(
+            f"\n[ERROR] MODEL='{MODEL}' does not support tool calling, "
+            f"which this agent requires.\n"
+        )
+    MAX_INPUT_TOKENS = profile.get("max_input_tokens")
+    logging.info(
+        f"Model '{MODEL}' profile OK "
+        f"(tool_calling=True, max_input_tokens={MAX_INPUT_TOKENS})"
+    )
+else:
+    MAX_INPUT_TOKENS = None
+    logging.warning(
+        f"No capability profile available for MODEL='{MODEL}'. "
+        f"Skipping capability check."
+    )
+
+# Bind tools
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
+
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
@@ -144,12 +180,26 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     annotated_image: Optional[str] = None
     start_time = time.perf_counter()
 
+    # Accumulate tracking parameters over sequential agent steps
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     while iterations < max_iterations:
         iterations += 1
         logging.info(f"🤖 Agent iteration {iterations}/{max_iterations}")
 
         response: AIMessage = llm_with_tools.invoke(messages)
         messages.append(response)
+
+        # Extract usage data safely from the runtime response metadata
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            meta = response.usage_metadata
+            total_input_tokens += meta.get("input_tokens", 0)
+            total_output_tokens += meta.get("output_tokens", 0)
+            
+            # Switch context limit flag if input tokens exceed the profile threshold
+            if MAX_INPUT_TOKENS and meta.get("input_tokens", 0) >= MAX_INPUT_TOKENS:
+                logging.warning("⚠️ Approaching model max_input_tokens framework limits!")
 
         if not response.tool_calls:
             loop_time = round(time.perf_counter() - start_time, 4)
@@ -160,7 +210,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 "agent_loop_time_s": loop_time,
                 "iterations": iterations,
                 "tools_called": tools_called,
-                "context_limit_exceeded": False,
+                "tokens_used": {
+                    "input": total_input_tokens,
+                    "output": total_output_tokens,
+                    "total": total_input_tokens + total_output_tokens
+                }
             }
 
         for tool_call in response.tool_calls:
@@ -188,7 +242,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "agent_loop_time_s": loop_time,
         "iterations": iterations,
         "tools_called": tools_called,
-        "context_limit_exceeded": True,
+        "tokens_used": {
+            "input": total_input_tokens,
+            "output": total_output_tokens,
+            "total": total_input_tokens + total_output_tokens
+        }
     }
 
 
@@ -222,7 +280,7 @@ def chat(request: ChatRequest):
     for msg in request.messages:
         if msg.role == "user":
             if msg.image_base64:
-                latest_image = msg.image_base64          # saved for detect_objects tool
+                latest_image = msg.image_base64
                 content = msg.content + "\n[An image was uploaded. Use existing tools to analyze it according to user instructions.]"
             else:
                 content = msg.content
