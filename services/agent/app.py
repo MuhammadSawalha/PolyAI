@@ -146,7 +146,7 @@ TOOLS = {
 }
 
 
-llm = init_chat_model(MODEL, temperature=0)
+llm = llm = init_chat_model(MODEL, temperature=0)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 # Capability check
