@@ -145,8 +145,9 @@ TOOLS = {
     show_annotated_image.name: show_annotated_image,
 }
 
-# Initialize the model dynamically
+
 llm = init_chat_model(MODEL, temperature=0)
+llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 # Capability check
 try:
@@ -172,8 +173,7 @@ else:
         f"Skipping capability check."
     )
 
-# Bind tools
-llm_with_tools = llm.bind_tools(list(TOOLS.values()))
+
 def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
     Simple ReAct loop with an infinite loop safety guard:
