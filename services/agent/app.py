@@ -146,7 +146,7 @@ TOOLS = {
 }
 
 # Initialize the model dynamically
-llm = init_chat_model(MODEL, temperature=0)
+llm = llm = init_chat_model(MODEL, temperature=0)
 
 # Capability check
 try:
