@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
 from typing import List, Optional
 
@@ -127,7 +128,14 @@ TOOLS = {
     detect_objects.name: detect_objects
 }
 
-llm = init_chat_model(MODEL, temperature=0)
+# Initialize a rate limiter (30 Requests per minute baseline, max burst capacity of 2 requests)
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.5,      # Add credit for 1 request every 2 seconds
+    check_every_n_seconds=0.1,    # Thread poll wake-up interval 
+    max_bucket_size=2             # Maximum allowed burst window size
+)
+
+llm = init_chat_model(MODEL, temperature=0, rate_limiter=rate_limiter)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
