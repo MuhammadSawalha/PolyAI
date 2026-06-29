@@ -60,8 +60,17 @@ export default function Chat() {
     setLoading(true);
 
     try {
-      const reply = await sendMessage(next);
-      setMessages([...next, { role: "assistant", content: reply }]);
+      const { response, annotated_image, image_url } = await sendMessage(next);
+
+      setMessages([
+        ...next,
+        {
+          role: "assistant",
+          content: response,
+          ...(annotated_image ? { annotated_image } : {}),
+          ...(image_url ? { image_url } : {}),
+        },
+      ]);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Something went wrong");
     } finally {
