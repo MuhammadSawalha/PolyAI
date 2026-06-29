@@ -146,7 +146,6 @@ TOOLS = {
     show_annotated_image.name: show_annotated_image,
 }
 
-
 # Initialize a rate limiter (30 Requests per minute baseline, max burst capacity of 2 requests)
 rate_limiter = InMemoryRateLimiter(
     requests_per_second=0.5,      # Add credit for 1 request every 2 seconds

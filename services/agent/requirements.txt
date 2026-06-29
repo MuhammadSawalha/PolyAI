@@ -4,6 +4,7 @@ python-dotenv
 langchain
 langgraph
 langchain-core
+langchain-aws
 
 langchain[openai]
 langchain[anthropic]
@@ -11,3 +12,8 @@ langchain[google-genai]
 
 httpx
 pydantic
+
+# Testing
+pytest==7.4.0
+pytest-cov==4.1.0
+pytest-html==3.2.0
