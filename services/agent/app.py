@@ -28,16 +28,16 @@ from pydantic import BaseModel
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock_converse")
 
-# Text-only models
 ALLOWED_MODELS = {
-    "openai:gpt-5.4-mini",
-    "anthropic:claude-haiku-4-5",
-    "google_genai:gemini-2.5-flash",
+    "anthropic.claude-3-haiku-20240307-v1:0",
+    "amazon.nova-micro-v1:0",
     "amazon.nova-lite-v1:0",
     "openai.gpt-oss-20b-1:0",
     "meta.llama3-1-8b-instruct-v1:0",
-    "amazon.nova-micro-v1:0",
+    "mistral.mistral-7b-instruct-v0:2"
 }
 
 if MODEL not in ALLOWED_MODELS:
@@ -153,7 +153,14 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=2             # Maximum allowed burst window size
 )
 
-llm = init_chat_model(MODEL, temperature=0, rate_limiter=rate_limiter)
+# Configuration update to instruct init_chat_model to use the Bedrock infrastructure layer
+llm = init_chat_model(
+    MODEL,
+    model_provider=MODEL_PROVIDER,
+    region_name=AWS_REGION, 
+    temperature=0, 
+    rate_limiter=rate_limiter
+)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 # Capability check
