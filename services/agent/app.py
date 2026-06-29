@@ -57,6 +57,10 @@ SYSTEM_PROMPT = (
     "if the user said yes for the annotated image, you must include it in your response. not the link, just the image itself. "
 )
 
+class TokenUsage(BaseModel):
+    input: int
+    output: int
+    total: int
 
 class AgentChatResponse(BaseModel):
     response: str
@@ -67,6 +71,7 @@ class AgentChatResponse(BaseModel):
     iterations: int
     tools_called: List[str]
     context_limit_exceeded: bool
+    tokens_used: TokenUsage  # Added token usage
 
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
@@ -140,8 +145,34 @@ TOOLS = {
     show_annotated_image.name: show_annotated_image,
 }
 
-llm = llm = init_chat_model(MODEL, temperature=0)
+
+llm = init_chat_model(MODEL, temperature=0)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
+
+# Capability check
+try:
+    profile = llm.profile or {}
+except Exception:
+    profile = {}
+
+if profile:
+    if not profile.get("tool_calling", False):
+        raise SystemExit(
+            f"\n[ERROR] MODEL='{MODEL}' does not support tool calling, "
+            f"which this agent requires.\n"
+        )
+    MAX_INPUT_TOKENS = profile.get("max_input_tokens")
+    logging.info(
+        f"Model '{MODEL}' profile OK "
+        f"(tool_calling=True, max_input_tokens={MAX_INPUT_TOKENS})"
+    )
+else:
+    MAX_INPUT_TOKENS = None
+    logging.warning(
+        f"No capability profile available for MODEL='{MODEL}'. "
+        f"Skipping capability check."
+    )
+
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
@@ -158,12 +189,28 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     image_url = None
     start_time = time.perf_counter()
 
+# Accumulate tracking parameters over sequential agent steps
+    total_input_tokens = 0
+    total_output_tokens = 0
+    context_limit_exceeded = False
+
     while iterations < max_iterations:
         iterations += 1
         logging.info(f"🤖 Agent iteration {iterations}/{max_iterations}")
 
         response: AIMessage = llm_with_tools.invoke(messages)
         messages.append(response)
+	
+	# Extract usage data safely from the runtime response metadata
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            meta = response.usage_metadata
+            total_input_tokens += meta.get("input_tokens", 0)
+            total_output_tokens += meta.get("output_tokens", 0)
+            
+            # Switch context limit flag if input tokens exceed the profile threshold
+            if MAX_INPUT_TOKENS and meta.get("input_tokens", 0) >= MAX_INPUT_TOKENS:
+                logging.warning("⚠️ Approaching model max_input_tokens framework limits!")
+                context_limit_exceeded = True
 
         if not response.tool_calls:
             loop_time = round(time.perf_counter() - start_time, 4)
@@ -175,7 +222,12 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 "agent_loop_time_s": loop_time,
                 "iterations": iterations,
                 "tools_called": tools_called,
-                "context_limit_exceeded": False,
+                "context_limit_exceeded": context_limit_exceeded,
+                "tokens_used": {
+                    "input": total_input_tokens,
+                    "output": total_output_tokens,
+                    "total": total_input_tokens + total_output_tokens
+                }
             }
 
         for tool_call in response.tool_calls:
@@ -218,6 +270,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "iterations": iterations,
         "tools_called": tools_called,
         "context_limit_exceeded": True,
+        "tokens_used": {
+            "input": total_input_tokens,
+            "output": total_output_tokens,
+            "total": total_input_tokens + total_output_tokens
+        }
     }
 
 
