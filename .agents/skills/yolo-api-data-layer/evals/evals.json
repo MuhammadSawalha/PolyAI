@@ -1,0 +1,162 @@
+{
+  "evals": [
+    {
+      "name": "sqlalchemy-full-refactoring",
+      "prompt": "Use the yolo-api-data-layer skill to refactor the YOLO FastAPI service from raw sqlite3 to SQLAlchemy ORM. Create db.py with engine and session factory, models.py with ORM classes, update app.py to use dependency injection for all database operations, and refactor all tests to use file-based SQLite fixtures.",
+      "expected_output": "Complete SQLAlchemy refactoring of YOLO API with db.py module, models.py module, updated app.py using ORM for all database operations, dependency injection in all endpoints, file-based test fixtures, and ORM patterns throughout. All existing API contracts preserved. No raw SQL or sqlite3 module usage remaining.",
+      "assertions": [
+        "services/yolo/db.py created with SQLAlchemy engine, SessionLocal, Base, and get_db()",
+        "services/yolo/models.py created with PredictionSession and DetectionObject ORM models",
+        "services/yolo/app.py imports SQLAlchemy modules and models, removes sqlite3",
+        "All endpoints accept db: Session = Depends(get_db) parameter",
+        "All database operations use ORM: db.query(), db.add(), db.commit()",
+        "No raw SQL strings anywhere in app.py",
+        "No row['column'] dict access - uses obj.column attribute access",
+        "save_prediction_session and save_detection_object helpers accept db: Session",
+        "Base.metadata.create_all(bind=engine) replaces init_db() SQL",
+        "services/yolo/tests/test_api.py has test_engine fixture using tempfile.mkstemp()",
+        "test_engine creates file-based SQLite database (not :memory:)",
+        "setup_db fixture has autouse=True and depends on test_engine",
+        "db_session fixture depends on test_engine",
+        "All test operations use ORM patterns",
+        "No sqlite3 imports in tests",
+        "All original endpoints unchanged: /predict, /prediction/{uid}, /predictions/label/{label}, /predictions/score/{min_score}",
+        "All status codes preserved: 200, 400, 404, 503",
+        "YoloPredictResponse schema unchanged",
+        "CONFIDENCE_THRESHOLD environment variable handling preserved",
+        "YOLO model inference logic unchanged"
+      ]
+    },
+    {
+      "name": "add-orm-endpoint-recent-sessions",
+      "prompt": "Add a new GET /predictions/recent endpoint to the YOLO API that returns the N most recent prediction sessions with their detection counts and labels, using SQLAlchemy ORM queries ordered by timestamp.",
+      "expected_output": "New GET /predictions/recent endpoint that accepts optional limit parameter, queries PredictionSession table ordered by timestamp descending using ORM, loads related detection_objects via relationship, and returns JSON with session metadata and detection summaries.",
+      "assertions": [
+        "Endpoint GET /predictions/recent is added to app.py",
+        "Endpoint signature includes db: Session = Depends(get_db) parameter",
+        "Endpoint signature includes optional limit parameter (default 10)",
+        "Uses db.query(PredictionSession).order_by(desc(PredictionSession.timestamp))",
+        "Uses .limit(limit).all() to fetch limited results",
+        "Response includes uid, timestamp, detection_count, labels fields",
+        "Accesses s.detection_objects relationship instead of manual JOIN",
+        "Returns list of dicts with correct structure",
+        "No raw SQL used",
+        "Endpoint returns 200 status with correct JSON structure",
+        "Existing endpoints remain unchanged"
+      ]
+    },
+    {
+      "name": "add-database-table-user-feedback",
+      "prompt": "Add a UserFeedback table to the YOLO API database to store user ratings and comments per prediction. Define ORM model with foreign key to PredictionSession, create endpoint POST /predictions/{uid}/feedback to accept feedback, and add ORM relationship with cascade configuration.",
+      "expected_output": "New UserFeedback ORM model in models.py with rating and comment fields, foreign key to PredictionSession, relationship with backref for reverse access, new POST /predictions/{uid}/feedback endpoint accepting rating and optional comment, proper validation and error handling.",
+      "assertions": [
+        "UserFeedback class defined in models.py",
+        "UserFeedback has __tablename__ = 'user_feedback'",
+        "UserFeedback has id (Integer, primary_key, autoincrement)",
+        "UserFeedback has prediction_uid (String, ForeignKey to prediction_sessions.uid, indexed)",
+        "UserFeedback has rating (Integer) for ratings",
+        "UserFeedback has comment (String, nullable=True)",
+        "UserFeedback has created_at (DateTime, default=datetime.utcnow)",
+        "UserFeedback defines relationship to PredictionSession with backref='feedback'",
+        "POST /predictions/{uid}/feedback endpoint added",
+        "Endpoint includes db: Session = Depends(get_db)",
+        "Endpoint accepts rating (required) and comment (optional) parameters",
+        "Endpoint validates that prediction exists before saving feedback",
+        "Endpoint returns 404 if prediction not found",
+        "Endpoint creates UserFeedback ORM instance and saves with db.add()/db.commit()",
+        "Endpoint returns 200 with confirmation message",
+        "Base.metadata.create_all() automatically creates user_feedback table",
+        "New table does not affect existing endpoints"
+      ]
+    },
+    {
+      "name": "add-column-processing-time-ms",
+      "prompt": "Add a processing_time_ms column to the PredictionSession table to track inference time, update the POST /predict endpoint to capture and store this metric, and update save_prediction_session helper to accept and persist the processing time.",
+      "expected_output": "New processing_time_ms column added to PredictionSession model as Integer column, POST /predict endpoint calculates elapsed time in milliseconds, save_prediction_session helper accepts processing_time_ms parameter, column populated for all new predictions, existing predictions nullable for backward compatibility.",
+      "assertions": [
+        "PredictionSession model in models.py has new processing_time_ms column",
+        "processing_time_ms is Integer column type",
+        "processing_time_ms column has nullable=True for backward compatibility",
+        "save_prediction_session helper signature includes processing_time_ms parameter",
+        "save_prediction_session creates PredictionSession with processing_time_ms value",
+        "POST /predict endpoint captures start_time = time.time() at beginning",
+        "POST /predict calculates processing_time = int((time.time() - start_time) * 1000)",
+        "POST /predict passes processing_time_ms to save_prediction_session()",
+        "YoloPredictResponse may optionally include processing_time_ms field",
+        "Column added to existing PredictionSession without breaking existing queries",
+        "time module imported in app.py",
+        "Base.metadata.create_all() creates column for new databases",
+        "Existing endpoints continue to work"
+      ]
+    },
+    {
+      "name": "configure-database-backend-postgres",
+      "prompt": "Configure the YOLO API database layer to support both SQLite (development) and PostgreSQL (production) via environment variables DB_BACKEND, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME. Update db.py to conditionally construct connection strings.",
+      "expected_output": "db.py reads environment variables (DB_BACKEND, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME) with sensible defaults, constructs appropriate SQLAlchemy database URL for SQLite or PostgreSQL, engine creation works identically for both backends, no code changes needed to switch databases.",
+      "assertions": [
+        "db.py defines DB_BACKEND = os.getenv('DB_BACKEND', 'sqlite')",
+        "db.py defines DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME with defaults",
+        "db.py conditionally builds DATABASE_URL based on DB_BACKEND",
+        "SQLite URL format: 'sqlite:///./predictions.db'",
+        "PostgreSQL URL format: 'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'",
+        "create_engine() uses appropriate connect_args per backend",
+        "SQLite includes connect_args={'check_same_thread': False}",
+        "PostgreSQL omits SQLite-specific connect_args",
+        "engine = create_engine(DATABASE_URL, connect_args=...)",
+        "SessionLocal = sessionmaker(bind=engine) unchanged regardless of backend",
+        "README documents environment variables needed for PostgreSQL",
+        "Local development uses default SQLite without setting environment variables",
+        "Production can switch to PostgreSQL by setting 5 environment variables",
+        "No hardcoded database URLs in code",
+        "All existing ORM models and queries work with both backends"
+      ]
+    },
+    {
+      "name": "implement-cascade-delete-session",
+      "prompt": "Implement cascade delete pattern in the YOLO API database so that deleting a PredictionSession automatically deletes all its related DetectionObject records. Add relationship with cascade configuration and create DELETE /predictions/{uid} endpoint.",
+      "expected_output": "PredictionSession model defines DetectionObject relationship with cascade='all, delete-orphan' configuration. New DELETE /predictions/{uid} endpoint queries session by uid, deletes it (cascading deletes all detection objects), returns 200 on success or 404 if not found.",
+      "assertions": [
+        "PredictionSession.detection_objects relationship defined with cascade='all, delete-orphan'",
+        "relationship uses back_populates='prediction_session' for bidirectional reference",
+        "DELETE /predictions/{uid} endpoint added to app.py",
+        "Endpoint includes db: Session = Depends(get_db)",
+        "Endpoint queries PredictionSession by uid",
+        "Endpoint returns 404 if prediction not found",
+        "Endpoint uses db.delete(session) and db.commit()",
+        "Single db.delete() call cascades to delete all detection_objects",
+        "No manual deletion of detection_objects required",
+        "Endpoint returns 200 with confirmation: {'status': 'deleted', 'uid': uid}",
+        "Cascade delete is atomic: entire operation succeeds or rolls back",
+        "Related detection_objects are automatically removed from database",
+        "Cascade delete works for child tables with foreign key relationships"
+      ]
+    },
+    {
+      "name": "test-fixtures-file-based-database",
+      "prompt": "Implement test fixtures for the YOLO API that use file-based SQLite database (not in-memory) to enable proper TestClient thread sharing. Create test_engine, setup_db, and db_session fixtures that share a single database file across all threads.",
+      "expected_output": "test_engine fixture creates temporary file-based SQLite database using tempfile.mkstemp(), creates all tables, and yields engine. setup_db (autouse) overrides get_db dependency with test session factory from same engine. db_session fixture provides session for manual database operations in tests. All fixtures depend on test_engine to ensure single shared database.",
+      "assertions": [
+        "test_engine fixture has scope='function'",
+        "test_engine uses tempfile.mkstemp() to create temp database file",
+        "test_engine creates engine with f'sqlite:///{db_path}' (file-based, not :memory:)",
+        "test_engine includes connect_args={'check_same_thread': False}",
+        "test_engine calls Base.metadata.create_all(bind=engine)",
+        "test_engine yields engine for use by other fixtures",
+        "test_engine cleanup: Base.metadata.drop_all(bind=engine), engine.dispose(), os.unlink(db_path)",
+        "setup_db fixture has autouse=True",
+        "setup_db depends on test_engine parameter",
+        "setup_db creates TestingSessionLocal = sessionmaker(bind=test_engine)",
+        "setup_db overrides app.dependency_overrides[get_db] with test session factory",
+        "setup_db yields for test execution",
+        "setup_db clears app.dependency_overrides.clear() after test",
+        "db_session fixture depends on test_engine parameter",
+        "db_session creates session from same engine: SessionLocal = sessionmaker(bind=test_engine)",
+        "db_session yields fresh session for test",
+        "db_session closes session in finally block",
+        "TestClient uses app with injected database via dependency_overrides",
+        "File-based database is thread-safe and accessible from TestClient background thread",
+        "No :memory: databases used in tests"
+      ]
+    }
+  ]
+}

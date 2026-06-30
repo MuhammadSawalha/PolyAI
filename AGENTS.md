@@ -13,13 +13,17 @@ services/
 
 ---
 
-## Terminal Commands - Students Run These Themselves
+## Terminal Commands
 
 **Never run `npm`, `pip`, `git`, or any other shell command on behalf of a student.**
 
-> Note from the instructor (Alon): This is intentional. Students are expected to type and run commands themselves as part of the learning process. I've explicitly asked the assistant not to touch the terminal. If this feels inconvenient, that's on me.
+Instead, show the exact command and explain what it does.
 
-Instead, show the exact command and explain what it does:
+###  Verification Commands
+
+* **Mandatory Execution:** You must execute all necessary project verification commands whenever required by this skill (including `pytest`, `python -m pytest`, coverage tools like `pytest --cov=app`, validation scripts, or inspection commands like `grep`, `find`, `ls`, `cat`).
+* **Self-Healing Loop:** If a verification command fails, diagnose and resolve the issue immediately, then rerun the verification until it passes.
+* **No Delegation:** Do not ask the student to run verification commands unless the task explicitly requires manual student execution.
 
 **Do this:**
 > Run this in your terminal inside `services/agent/`:
@@ -80,3 +84,20 @@ result = create_react_agent(llm, tools).invoke(state)
 ### Do not use high-level agent frameworks as a black box
 `create_react_agent`, `AgentExecutor`, and similar wrappers hide the loop that students need to learn.
 Implement the ReAct loop manually in `run_agent()` inside `services/agent/app.py`.
+
+
+---
+
+## 🧠 Agent Skills & Evaluations Workflow
+
+This project utilizes a structured **Agent Skills** architecture to handle systematic refactoring and feature additions safely. 
+
+### 📂 Location and Loading
+* Skills are stored in `.agents/skills/<skill-name>/SKILL.md`.
+* Before performing any task related to a skill's description (e.g., modifying the YOLO data layer), read the associated `SKILL.md` completely.
+* Adhere strictly to the architectural rules, file layouts, and constraints specified inside the skill instructions.
+
+### 🧪 Evaluation Driven Development
+* Automated test cases and mock expectations for skills reside in `.agents/skills/<skill-name>/evals/evals.json`.
+* Do not make arbitrary design decisions. Ensure the generated code perfectly matches the `expected_output` requirements defined in the evaluation suite.
+* Maintain existing endpoint routes, HTTP status codes, and structural validation payloads intact to prevent breaking downstream components.

@@ -1,25 +1,76 @@
 import os
 import pytest
-import sqlite3
+import tempfile
 import importlib
 import signal
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("CONFIDENCE_THRESHOLD", "0.5")
 
 import app as app_module
-from app import app, init_db, save_prediction_session, save_detection_object
+from app import app, save_prediction_session, save_detection_object
+from db import get_db
+from models import Base, PredictionSession, DetectionObject
 
 TEST_IMAGE = os.path.join(os.path.dirname(__file__), "data", "beatles.jpeg")
 
 
+@pytest.fixture(scope="function")
+def test_engine():
+    """
+    Creates a file-based SQLite test database shared across threads.
+    
+    ✅ CRITICAL: File-based SQLite (not :memory:) ensures TestClient background thread
+    can access the same database as the main test thread.
+    """
+    # Create a temporary file for the test database
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(db_fd)  # Close file descriptor; SQLite will handle the file
+    
+    database_url = f"sqlite:///{db_path}"
+    engine = create_engine(database_url, connect_args={"check_same_thread": False})
+    
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    
+    # Cleanup
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+    os.unlink(db_path)
+
+
 @pytest.fixture(autouse=True)
-def setup_db(tmp_path, monkeypatch):
-    """Automatically provisions a isolated, clean database for each separate test execution run."""
-    db_file = str(tmp_path / "test_predictions.db")
-    monkeypatch.setattr("app.DB_PATH", db_file)
-    init_db()
+def setup_db(test_engine):
+    """Provisions an isolated, clean file-based database for each test."""
+    TestingSessionLocal = sessionmaker(bind=test_engine)
+    
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    
+    app.dependency_overrides[get_db] = override_get_db
+    yield
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def db_session(test_engine):
+    """Provides a fresh ORM session using the SAME file-based database as the app."""
+    SessionLocal = sessionmaker(bind=test_engine)
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 @pytest.fixture
@@ -36,46 +87,41 @@ def test_health(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_save_prediction_session_real_db():
+def test_save_prediction_session_real_db(db_session):
     """Tests save_prediction_session by inserting a row into the real temp DB."""
     test_uid = "session-xyz-789"
     test_orig = "uploads/original.jpg"
     test_pred = "predicted/annotated.jpg"
 
-    save_prediction_session(test_uid, test_orig, test_pred)
+    save_prediction_session(db_session, test_uid, test_orig, test_pred)
 
-    with sqlite3.connect(app_module.DB_PATH) as conn:  
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM prediction_sessions WHERE uid = ?", (test_uid,)
-        ).fetchone()
+    row = db_session.query(PredictionSession).filter_by(uid=test_uid).first()
 
     assert row is not None
-    assert row["uid"] == test_uid
-    assert row["original_image"] == test_orig
-    assert row["predicted_image"] == test_pred
+    assert row.uid == test_uid
+    assert row.original_image == test_orig
+    assert row.predicted_image == test_pred
 
 
-def test_save_detection_object_real_db():
+def test_save_detection_object_real_db(db_session):
     """Tests save_detection_object by inserting a row into the real temp DB."""
     test_uid = "session-xyz-789"
     test_label = "person"
     test_score = 0.98
     test_box = [100, 150, 200, 250]
 
-    save_detection_object(test_uid, test_label, test_score, test_box)
+    # First create a session
+    save_prediction_session(db_session, test_uid, "orig.jpg", "pred.jpg")
+    # Then save detection object
+    save_detection_object(db_session, test_uid, test_label, test_score, test_box)
 
-    with sqlite3.connect(app_module.DB_PATH) as conn:  
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM detection_objects WHERE prediction_uid = ?", (test_uid,)
-        ).fetchone()
+    row = db_session.query(DetectionObject).filter_by(prediction_uid=test_uid).first()
 
     assert row is not None
-    assert row["prediction_uid"] == test_uid
-    assert row["label"] == test_label
-    assert row["score"] == test_score
-    assert row["box"] == str(test_box)
+    assert row.prediction_uid == test_uid
+    assert row.label == test_label
+    assert row.score == test_score
+    assert row.box == str(test_box)
 
 
 def test_confidence_threshold_default_fallback():
@@ -142,10 +188,10 @@ def test_predict_invalid_file_extension(client):
 
 # ====================================================================================
 
-def test_get_prediction_by_uid_success(client):
+def test_get_prediction_by_uid_success(db_session, client):
     """Seed data directly to the real test database and read it via API."""
-    save_prediction_session("abc-123", "uploads/abc-123.jpg", "predicted/abc-123.jpg")
-    save_detection_object("abc-123", "dog", 0.95, [10, 20, 30, 40])
+    save_prediction_session(db_session, "abc-123", "uploads/abc-123.jpg", "predicted/abc-123.jpg")
+    save_detection_object(db_session, "abc-123", "dog", 0.95, [10, 20, 30, 40])
 
     response = client.get("/prediction/abc-123")
     
@@ -162,34 +208,36 @@ def test_get_prediction_by_uid_not_found(client):
     assert response.json()["detail"] == "Prediction not found"
 
 
-def test_get_prediction_image_success(tmp_path, monkeypatch, client):
+def test_get_prediction_image_success(db_session, client):
     """Verifies image payload distribution against real storage paths."""
-    fake_img = tmp_path / "real_file.jpg"
-    fake_img.write_bytes(b"jpeg-binary-payload")
+    temp_dir = tempfile.mkdtemp()
+    fake_img_path = os.path.join(temp_dir, "real_file.jpg")
+    with open(fake_img_path, "wb") as f:
+        f.write(b"jpeg-binary-payload")
 
-    save_prediction_session("img-123", "orig.jpg", str(fake_img))
+    save_prediction_session(db_session, "img-123", "orig.jpg", fake_img_path)
 
     response = client.get("/prediction/img-123/image")
     assert response.status_code == 200
     assert response.content == b"jpeg-binary-payload"
 
 
-def test_get_prediction_image_not_found(client):
+def test_get_prediction_image_not_found(db_session, client):
     response = client.get("/prediction/missing-id/image")
     assert response.status_code == 404
 
-    save_prediction_session("ghost-id", "orig.jpg", "/nonexistent/disk/image.jpg")
+    save_prediction_session(db_session, "ghost-id", "orig.jpg", "/nonexistent/disk/image.jpg")
     response = client.get("/prediction/ghost-id/image")
     assert response.status_code == 404
 
 
-def test_get_predictions_by_label_success(client):
+def test_get_predictions_by_label_success(db_session, client):
     """Tests label search across rows populated in our real test database environment."""
-    save_prediction_session("sess-1", "o1.jpg", "p1.jpg")
-    save_prediction_session("sess-2", "o2.jpg", "p2.jpg")
+    save_prediction_session(db_session, "sess-1", "o1.jpg", "p1.jpg")
+    save_prediction_session(db_session, "sess-2", "o2.jpg", "p2.jpg")
     
-    save_detection_object("sess-1", "person", 0.91, [10, 20, 100, 200])
-    save_detection_object("sess-2", "cat", 0.85, [5, 5, 20, 20])
+    save_detection_object(db_session, "sess-1", "person", 0.91, [10, 20, 100, 200])
+    save_detection_object(db_session, "sess-2", "cat", 0.85, [5, 5, 20, 20])
 
     response = client.get("/predictions/label/person")
     
@@ -212,11 +260,11 @@ def test_get_predictions_by_label_empty_string(client):
     assert response.json()["detail"] == "Label cannot be empty"
 
 
-def test_get_predictions_by_score_success(client):
+def test_get_predictions_by_score_success(db_session, client):
     """Validates real math scoring evaluation boundaries inside SQLite."""
-    save_prediction_session("uid-1", "o1.jpg", "p1.jpg")
-    save_detection_object("uid-1", "person", 0.91, [10, 20, 100, 200])
-    save_detection_object("uid-1", "cup", 0.32, [0, 0, 10, 10])
+    save_prediction_session(db_session, "uid-1", "o1.jpg", "p1.jpg")
+    save_detection_object(db_session, "uid-1", "person", 0.91, [10, 20, 100, 200])
+    save_detection_object(db_session, "uid-1", "cup", 0.32, [0, 0, 10, 10])
 
    
     response = client.get("/predictions/score/0.5")
