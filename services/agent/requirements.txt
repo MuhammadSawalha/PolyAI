@@ -11,10 +11,12 @@ langchain[anthropic]
 langchain[google-genai]
 
 httpx
-boto3
 pydantic
 
 # Testing
 pytest==7.4.0
 pytest-cov==4.1.0
 pytest-html==3.2.0
+
+python-dotenv>=1.0.0
+boto3>=1.34.0
