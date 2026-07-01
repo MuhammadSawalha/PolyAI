@@ -3,12 +3,19 @@ import pytest
 import tempfile
 import importlib
 import signal
+import io
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from PIL import Image
+import numpy as np
 
 os.environ.setdefault("CONFIDENCE_THRESHOLD", "0.5")
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("AWS_S3_BUCKET", "fake-bucket")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "fake")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "fake")
 
 import app as app_module
 from app import app, save_prediction_session, save_detection_object
@@ -141,12 +148,47 @@ def test_confidence_threshold_default_fallback():
         importlib.reload(app_module)
 
 
+@patch("app.download_file_bytes", return_value=b"jpeg-binary-payload")
+def test_download_image_wrapper(mock_download_file_bytes):
+    image_bytes, content_type = app_module.download_image("chat-1/original/image.jpg")
+    assert image_bytes == b"jpeg-binary-payload"
+    assert content_type == "image/jpeg"
+    mock_download_file_bytes.assert_called_once_with("chat-1/original/image.jpg")
+
+
+@patch("app.upload_file_bytes", return_value=True)
+def test_upload_image_bytes_wrapper_success(mock_upload_file_bytes):
+    result = app_module.upload_image_bytes(b"jpeg-binary-payload", "chat-1/predicted/image.jpg")
+    assert result == "chat-1/predicted/image.jpg"
+    mock_upload_file_bytes.assert_called_once()
+
+
+@patch("app.upload_file_bytes", return_value=False)
+def test_upload_image_bytes_wrapper_failure(mock_upload_file_bytes):
+    with pytest.raises(RuntimeError, match="Failed to upload image to S3 key chat-1/predicted/image.jpg"):
+        app_module.upload_image_bytes(b"jpeg-binary-payload", "chat-1/predicted/image.jpg")
+
+    mock_upload_file_bytes.assert_called_once()
+
+
+@patch("app.download_image", return_value=(b"jpeg-binary-payload", "image/jpeg"))
+def test_get_image_response_wrapper(mock_download_image):
+    result = app_module.get_image_response("chat-1/predicted/image.jpg")
+    assert result == (b"jpeg-binary-payload", "image/jpeg")
+    mock_download_image.assert_called_once_with("chat-1/predicted/image.jpg")
+
+
 # ====================================================================================
 
-@patch("app.Image")
+@patch("app.upload_image_bytes")
+@patch("app.download_image")
 @patch("app.model")
-def test_predict_success_with_detections(mock_model, mock_image, client):
+def test_predict_success_with_detections(mock_model, mock_download_image, mock_upload_image_bytes, client):
     """Tests /predict happy path: Verifies database storage integration concurrently."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image_buffer, format="JPEG")
+    mock_download_image.return_value = (image_buffer.getvalue(), "image/jpeg")
+
     mock_cls_tensor = MagicMock()
     mock_cls_tensor.item.return_value = 0
     
@@ -160,30 +202,103 @@ def test_predict_success_with_detections(mock_model, mock_image, client):
 
     fake_result = MagicMock()
     fake_result.boxes = [fake_box]  
-    fake_result.plot.return_value = MagicMock()
+    fake_result.plot.return_value = Image.new("RGB", (4, 4), color="black")
 
     mock_model.return_value = [fake_result]
     mock_model.names = {0: "dog"}
 
     response = client.post(
         "/predict",
-        files={"file": ("test_image.jpg", b"fake_data", "image/jpeg")}
+        json={"image_s3_key": "chat-1/original/test_image.jpg"}
     )
 
     assert response.status_code == 200
     data = response.json()
+    assert data["original_image_s3_key"] == "chat-1/original/test_image.jpg"
     assert data["detection_count"] == 1
     assert data["labels"] == ["dog"]
     assert "time_took" in data
+    assert data["predicted_image_s3_key"].endswith("/predicted/test_image.jpg")
+    mock_download_image.assert_called_once_with("chat-1/original/test_image.jpg")
+    mock_upload_image_bytes.assert_called_once()
 
 
 def test_predict_invalid_file_extension(client):
     response = client.post(
         "/predict",
-        files={"file": ("document.txt", b"hello world", "text/plain")}
+        json={"image_s3_key": "chat-1/original/document.txt"}
     )
     assert response.status_code == 400
     assert response.json()["detail"] == "Only image files are supported (.jpg, .jpeg, .png)"
+
+
+def test_predict_missing_image_s3_key(client):
+    response = client.post(
+        "/predict",
+        json={"image_s3_key": "   "}
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "image_s3_key is required"
+
+
+@patch("app.model")
+@patch("app.download_image", side_effect=RuntimeError("download failed"))
+def test_predict_download_failure(mock_download_image, mock_model, client):
+    response = client.post(
+        "/predict",
+        json={"image_s3_key": "image.jpg"}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Failed to download source image from S3: download failed"
+    mock_model.assert_not_called()
+    mock_download_image.assert_called_once_with("image.jpg")
+
+
+@patch("app.upload_image_bytes", side_effect=RuntimeError("upload failed"))
+@patch("app.download_image")
+@patch("app.Image.fromarray")
+@patch("app.model")
+def test_predict_upload_failure_and_array_plot_output(
+    mock_model,
+    mock_fromarray,
+    mock_download_image,
+    mock_upload_image_bytes,
+    client,
+):
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image_buffer, format="PNG")
+    mock_download_image.return_value = (image_buffer.getvalue(), "image/png")
+
+    mock_cls_tensor = MagicMock()
+    mock_cls_tensor.item.return_value = 0
+
+    mock_xyxy_tensor = MagicMock()
+    mock_xyxy_tensor.tolist.return_value = [10, 20, 30, 40]
+
+    fake_box = MagicMock()
+    fake_box.cls = [mock_cls_tensor]
+    fake_box.conf = [0.92]
+    fake_box.xyxy = [mock_xyxy_tensor]
+
+    fake_result = MagicMock()
+    fake_result.boxes = [fake_box]
+    fake_result.plot.return_value = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    mock_model.return_value = [fake_result]
+    mock_model.names = {0: "dog"}
+    mock_fromarray.return_value = Image.new("RGB", (4, 4), color="black")
+
+    response = client.post(
+        "/predict",
+        json={"image_s3_key": "image.png"}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Failed to upload predicted image to S3: upload failed"
+    mock_download_image.assert_called_once_with("image.png")
+    mock_fromarray.assert_called_once()
+    mock_upload_image_bytes.assert_called_once()
 
 
 # ====================================================================================
@@ -208,27 +323,24 @@ def test_get_prediction_by_uid_not_found(client):
     assert response.json()["detail"] == "Prediction not found"
 
 
-def test_get_prediction_image_success(db_session, client):
-    """Verifies image payload distribution against real storage paths."""
-    temp_dir = tempfile.mkdtemp()
-    fake_img_path = os.path.join(temp_dir, "real_file.jpg")
-    with open(fake_img_path, "wb") as f:
-        f.write(b"jpeg-binary-payload")
-
-    save_prediction_session(db_session, "img-123", "orig.jpg", fake_img_path)
+@patch("app.get_image_response", return_value=(b"jpeg-binary-payload", "image/jpeg"))
+def test_get_prediction_image_success(mock_get_image_response, db_session, client):
+    save_prediction_session(db_session, "img-123", "orig.jpg", "chat-1/img-123/predicted/real_file.jpg")
 
     response = client.get("/prediction/img-123/image")
     assert response.status_code == 200
     assert response.content == b"jpeg-binary-payload"
+    mock_get_image_response.assert_called_once_with("chat-1/img-123/predicted/real_file.jpg")
 
 
 def test_get_prediction_image_not_found(db_session, client):
     response = client.get("/prediction/missing-id/image")
     assert response.status_code == 404
 
-    save_prediction_session(db_session, "ghost-id", "orig.jpg", "/nonexistent/disk/image.jpg")
-    response = client.get("/prediction/ghost-id/image")
-    assert response.status_code == 404
+    save_prediction_session(db_session, "ghost-id", "orig.jpg", "chat-1/ghost-id/predicted/image.jpg")
+    with patch("app.get_image_response", side_effect=FileNotFoundError):
+        response = client.get("/prediction/ghost-id/image")
+        assert response.status_code == 404
 
 
 def test_get_predictions_by_label_success(db_session, client):
