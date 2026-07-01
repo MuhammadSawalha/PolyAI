@@ -1,12 +1,13 @@
 import base64
-import io
 import json
 import logging
 import os
+import posixpath
 import time
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
 from typing import List, Optional
+from uuid import uuid4
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -19,16 +20,18 @@ logging.getLogger("langchain").setLevel(logging.DEBUG)
 logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel
 
+from s3 import download_file_bytes, upload_file_bytes
+
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
-AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock_converse")
 
 ALLOWED_MODELS = {
@@ -76,7 +79,30 @@ class AgentChatResponse(BaseModel):
 
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
+_current_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_image_s3_key", default=None)
 _current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
+_current_predicted_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_predicted_image_s3_key", default=None)
+
+
+def build_original_image_key(chat_id: str, prediction_id: str, image_ext: str = ".jpg") -> str:
+    sanitized_ext = image_ext.lower() if image_ext.startswith(".") else f".{image_ext.lower()}"
+    return posixpath.join(chat_id, prediction_id, "original", f"image{sanitized_ext}")
+
+
+def upload_base64_image(image_b64: str, object_key: str) -> str:
+    image_bytes = base64.b64decode(image_b64)
+    uploaded = upload_file_bytes(image_bytes, object_key, content_type="image/jpeg")
+    if not uploaded:
+        raise RuntimeError(f"Failed to upload image to S3 key {object_key}")
+    return object_key
+
+
+def download_image_base64(object_key: str) -> Optional[str]:
+    if not object_key:
+        return None
+
+    image_bytes = download_file_bytes(object_key)
+    return base64.b64encode(image_bytes).decode("ascii")
 
 
 def _normalize_response_content(content) -> str:
@@ -94,6 +120,15 @@ def _normalize_response_content(content) -> str:
 
 
 def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
+    predicted_image_s3_key = _current_predicted_image_s3_key.get()
+    if predicted_image_s3_key:
+        try:
+            annotated_image = download_image_base64(predicted_image_s3_key)
+            if annotated_image:
+                return annotated_image
+        except Exception as exc:
+            logging.warning("Failed to fetch annotated image from S3 key %s: %s", predicted_image_s3_key, exc)
+
     if not prediction_id:
         return None
 
@@ -126,18 +161,31 @@ def show_annotated_image() -> str:
 @tool
 def detect_objects() -> str:
     """Detect and identify objects in the image provided by the user using YOLO object detection."""
-    image_b64 = _current_image_b64.get()
-    if not image_b64:
+    image_s3_key = _current_image_s3_key.get()
+    if not image_s3_key:
         return json.dumps({"error": "No image was provided by the user."})
 
-    image_bytes = base64.b64decode(image_b64)
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(
-            f"{YOLO_SERVICE_URL}/predict",
-            files={"file": ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")},
-        )
-        response.raise_for_status()
-    return json.dumps(response.json())
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(f"{YOLO_SERVICE_URL}/predict", json={"image_s3_key": image_s3_key})
+            response.raise_for_status()
+        return json.dumps(response.json())
+    except httpx.HTTPStatusError as exc:
+        detail = None
+        try:
+            detail = exc.response.json().get("detail")
+        except Exception:
+            detail = exc.response.text
+        return json.dumps({
+            "error": "YOLO service request failed.",
+            "status_code": exc.response.status_code,
+            "detail": detail,
+        })
+    except httpx.RequestError as exc:
+        return json.dumps({
+            "error": "YOLO service is unavailable.",
+            "detail": str(exc),
+        })
 
 
 # Registry: map tool name -> tool function
@@ -266,6 +314,9 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 if current_id:
                     prediction_id = current_id
                     _current_prediction_id.set(current_id)
+                predicted_image_s3_key = tool_data.get("predicted_image_s3_key")
+                if predicted_image_s3_key:
+                    _current_predicted_image_s3_key.set(predicted_image_s3_key)
             
             if tool_name == "show_annotated_image":
                 tool_data = json.loads(tool_result.content)
@@ -318,6 +369,7 @@ class ChatRequest(BaseModel):
 def chat(request: ChatRequest):
     lc_messages = []
     latest_image = None
+    chat_id = str(uuid4())
 
     for msg in request.messages:
         if msg.role == "user":
@@ -330,14 +382,27 @@ def chat(request: ChatRequest):
         else:
             lc_messages.append(AIMessage(content=msg.content))
 
+    image_s3_key = None
+    if latest_image:
+        try:
+            pred_uid = str(uuid4())
+            s3_key = build_original_image_key(chat_id, pred_uid)
+            image_s3_key = upload_base64_image(latest_image, s3_key)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to upload image to S3: {exc}") from exc
+
     token_img = _current_image_b64.set(latest_image)
+    token_img_s3 = _current_image_s3_key.set(image_s3_key)
     token_pred = _current_prediction_id.set(None) # Reset local state per request context
+    token_predicted_key = _current_predicted_image_s3_key.set(None)
     try:
         agent_payload = run_agent(lc_messages)
         return agent_payload
     finally:
         _current_image_b64.reset(token_img)
+        _current_image_s3_key.reset(token_img_s3)
         _current_prediction_id.reset(token_pred)
+        _current_predicted_image_s3_key.reset(token_predicted_key)
 
 
 @app.get("/health")
