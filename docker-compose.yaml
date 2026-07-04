@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  frontend:
+    image: muhammadsawalha/frontend-service:0.0.1
+    container_name: frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - agent
+    networks:
+      - polyai-net
+
+  agent:
+    image: muhammadsawalha/agent-service:0.0.1
+    container_name: agent
+    ports:
+      - "8000:8000" 
+    environment:
+      - YOLO_SERVICE_URL=http://yolo:8080
+      - MODEL_PROVIDER=bedrock_converse
+      - MODEL=amazon.nova-lite-v1:0
+      - AWS_REGION=us-east-1
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    depends_on:
+      - yolo
+    networks:
+      - polyai-net
+
+  yolo:
+    image: muhammadsawalha/yolo-service:0.0.1
+    container_name: yolo
+    ports:
+      - "8080:8080"
+    networks:
+      - polyai-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    depends_on:
+      - yolo
+    networks:
+      - monitoring-net
+      - polyai-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring-net
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  polyai-net:
+    driver: bridge
+  monitoring-net:
+    driver: bridge

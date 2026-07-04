@@ -1,0 +1,17 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+pytest.ini
+.venv/
+venv/
+tests/
+.env
+predictions.db
+uploads/
+beatles.jpeg
+.git
