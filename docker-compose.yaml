@@ -15,9 +15,10 @@ services:
     image: muhammadsawalha/agent-service:0.0.1
     container_name: agent
     ports:
-      - "8000:8000" 
+      - "8000:8000"
     environment:
       - YOLO_SERVICE_URL=http://yolo:8080
+      - IMG_PROC_MCP_URL=http://img-proc-mcp:9000/mcp
       - MODEL_PROVIDER=bedrock_converse
       - MODEL=amazon.nova-lite-v1:0
       - AWS_REGION=us-east-1
@@ -25,6 +26,7 @@ services:
       - ~/.aws:/root/.aws:ro
     depends_on:
       - yolo
+      - img-proc-mcp
     networks:
       - polyai-net
 
@@ -33,6 +35,18 @@ services:
     container_name: yolo
     ports:
       - "8080:8080"
+    networks:
+      - polyai-net
+
+  img-proc-mcp:
+    image: muhammadsawalha/img-proc-mcp-service:0.0.1
+    container_name: img-proc-mcp
+    ports:
+      - "9000:9000"
+    environment:
+      - AWS_REGION=us-east-1
+    volumes:
+      - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
 

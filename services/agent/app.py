@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import time
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
@@ -28,6 +29,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel
 
 from s3 import download_file_bytes, upload_file_bytes
+from mcp_client import call_mcp_tool
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
@@ -51,14 +53,37 @@ if MODEL not in ALLOWED_MODELS:
     )
 
 SYSTEM_PROMPT = (
-    "You are an AI vision assistant. You help users analyze images via tools. "
-    "To analyze an image, you must run `detect_objects`, followed by `show_annotated_image` if the user requests to show the annotated image. "
-    "CRITICAL OUTPUT RULES:"
-    "1. If the user did not ask to see the annotated image, do not include it in your response. but you can ask him if he wants to see it. "
-    "2. If the user asked to see the annotated image, do not print raw image URLs just let the image appear directly. "
-    "3. You MUST read the tool output data from `detect_objects` and write a detailed, natural paragraph summary breaking down exactly what items were found. "
-    "4. Do not include raw XML tags like `<thinking>` or `</thinking>` in your text reply. "
-    "if the user said yes for the annotated image, you must include it in your response. not the link, just the image itself. "
+    "You are an AI vision assistant. You help users analyze and edit images via tools. "
+    "To analyze an image, you must run `detect_objects`. "
+    "If the user asks what is in the image, you must run `detect_objects` first to get a list of detected objects, then you You MUST read the tool output data from `detect_objects` and write a detailed, natural paragraph summary breaking down exactly what items were found. "
+    "If the user asks to see the annotated image, you must run `show_annotated_image` to get a public URL of the annotated image with bounding boxes. "
+    #"CRITICAL OUTPUT RULES:"
+    #"1. If the user did not ask to see the annotated image, do not include it in your response. but you can ask him if he wants to see it. "
+    #"2. If the user asked to see the annotated image, do not print raw image URLs just let the image appear directly. "
+    "If the user did not ask to see the annotated image, do not run `show_annotated_image`. but you can ask him if he wants to see it if his previous message was what is in the image ?. "
+    "If the user asked what is in the image ? and to show the annotated image in the same message, you must run `detect_objects` first, then after reading the tool output data from `detect_objects`you must run `show_annotated_image` to include the annotated image in your response. "
+    "Never print the raw `box` coordinate arrays (or a coordinates table) in your response to the user - "
+    "use them internally to identify which object is which, but describe objects in plain language instead (e.g. 'the person on the left', 'the car near the top'). "
+    "Do not include raw XML tags like `<thinking>` or `</thinking>` in your text reply. "
+    #"if the user said yes for the annotated image, you must include it in your response. not the link, just the image itself. "
+    "\n"
+    "IMAGE EDITING: You also have editing tools: `rotate`, `flip`, `blur`, `resize`, `crop`, `add_noise`. "
+    "Each edits the image currently being worked on and returns the result automatically to the user - you do not need a separate 'show' tool after an edit. "
+    "Edits can be chained in the same turn (e.g. rotate then blur); each edit builds on the previous edit's result. "
+    "To edit the WHOLE image, call the tool without a `bbox` argument. "
+    "To edit a SPECIFIC detected object (e.g. 'blur the second dog from the right', 'add noise to the detected car'), you must first call `detect_objects` to get a `detections` list, "
+    "where each entry has `label`, `score`, and `box` (a `[x1, y1, x2, y2]` pixel rectangle). "
+    "Reason over these box coordinates yourself to identify the requested object - e.g. for 'the Nth <label> from the right', filter detections to that label and sort by `box[0]` (the left edge, x1) descending, then pick the Nth one. "
+    "For 'from the left' sort ascending; for 'from the top'/'from the bottom' sort by `box[1]` (y1) ascending/descending. "
+    "Then call the matching editing tool, passing that detection's `box` as the `bbox` argument. "
+    "Box coordinates and labels are plain numbers/text, not image pixel data, so it is fine for you to see and reason over them. "
+    "Note: `rotate` only accepts angles that are multiples of 90 when `bbox` is given (whole-image rotation allows any angle). "
+    "`crop` requires a `bbox` and returns just that cropped region as the final image, not composited back into the full picture. "
+    "\n"
+    "NEVER emit markdown image syntax like `![alt](url)` or any inline image link for any image (annotated or edited) - "
+    "you have no real URL or image bytes to put there, so it will only ever render broken. "
+    "Every image (annotated_image, edited_image, image_url) is delivered automatically out-of-band and displayed by the frontend "
+    "separately from your text - just describe what was done in plain language and let the image appear on its own. "
 )
 
 class TokenUsage(BaseModel):
@@ -69,7 +94,10 @@ class TokenUsage(BaseModel):
 class AgentChatResponse(BaseModel):
     response: str
     prediction_id: Optional[str] = None
+    predicted_image_s3_key: Optional[str] = None
     annotated_image: Optional[str] = None
+    edited_image: Optional[str] = None
+    current_image_s3_key: Optional[str] = None
     image_url: Optional[str] = None
     agent_loop_time_s: float
     iterations: int
@@ -82,6 +110,18 @@ _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", 
 _current_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_image_s3_key", default=None)
 _current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
 _current_predicted_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_predicted_image_s3_key", default=None)
+
+IMAGE_EDIT_TOOL_NAMES = {"rotate", "flip", "blur", "resize", "crop", "add_noise"}
+
+
+def _parse_bbox(box_str: str) -> List[float]:
+    try:
+        box = json.loads(box_str)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Malformed bbox string from YOLO: {box_str!r}") from exc
+    if not isinstance(box, list) or len(box) != 4:
+        raise ValueError(f"Expected a 4-element bbox list, got: {box_str!r}")
+    return [float(v) for v in box]
 
 
 def build_original_image_key(chat_id: str, prediction_id: str, image_ext: str = ".jpg") -> str:
@@ -103,6 +143,21 @@ def download_image_base64(object_key: str) -> Optional[str]:
 
     image_bytes = download_file_bytes(object_key)
     return base64.b64encode(image_bytes).decode("ascii")
+
+
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_IMAGE_PLACEHOLDER_RE = re.compile(r"</?image\s*/?>", re.IGNORECASE)
+
+
+def _strip_markdown_images(text: str) -> str:
+    """Remove any markdown image syntax or literal <image> placeholder tokens the model
+    hallucinates (it has no real image bytes or URL to reference, so ![alt](url) or a bare
+    <image> tag always renders as either a broken image or dead text in the frontend)."""
+    stripped = _MARKDOWN_IMAGE_RE.sub("", text)
+    stripped = _IMAGE_PLACEHOLDER_RE.sub("", stripped)
+    lines = [line.rstrip() for line in stripped.split("\n")]
+    collapsed = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    return collapsed.strip()
 
 
 def _normalize_response_content(content) -> str:
@@ -160,7 +215,12 @@ def show_annotated_image() -> str:
 
 @tool
 def detect_objects() -> str:
-    """Detect and identify objects in the image provided by the user using YOLO object detection."""
+    """Detect and identify objects in the image provided by the user using YOLO object detection.
+
+    Returns a `detections` list with each object's `label`, `score`, and `box` ([x1, y1, x2, y2] pixel
+    coordinates), which you can reason over to target a specific object (e.g. "the second dog from the right")
+    for the image-editing tools.
+    """
     image_s3_key = _current_image_s3_key.get()
     if not image_s3_key:
         return json.dumps({"error": "No image was provided by the user."})
@@ -169,7 +229,23 @@ def detect_objects() -> str:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(f"{YOLO_SERVICE_URL}/predict", json={"image_s3_key": image_s3_key})
             response.raise_for_status()
-        return json.dumps(response.json())
+            result = response.json()
+
+            prediction_uid = result.get("prediction_uid")
+            if prediction_uid:
+                detail_response = client.get(f"{YOLO_SERVICE_URL}/prediction/{prediction_uid}")
+                detail_response.raise_for_status()
+                detection_objects = detail_response.json().get("detection_objects", [])
+                result["detections"] = [
+                    {
+                        "id": obj.get("id"),
+                        "label": obj.get("label"),
+                        "score": obj.get("score"),
+                        "box": _parse_bbox(obj.get("box")),
+                    }
+                    for obj in detection_objects
+                ]
+        return json.dumps(result)
     except httpx.HTTPStatusError as exc:
         detail = None
         try:
@@ -188,10 +264,72 @@ def detect_objects() -> str:
         })
 
 
+def _call_image_edit_tool(tool_name: str, arguments: dict) -> str:
+    image_s3_key = _current_image_s3_key.get()
+    if not image_s3_key:
+        return json.dumps({"error": "No image available to edit. Upload an image first."})
+    try:
+        result = call_mcp_tool(tool_name, {"image_s3_key": image_s3_key, **arguments})
+    except Exception as exc:
+        return json.dumps({"error": "img-proc-mcp request failed.", "detail": str(exc)})
+    return json.dumps(result)
+
+
+@tool
+def rotate(angle: float, bbox: Optional[List[float]] = None) -> str:
+    """Rotate the current image by `angle` degrees counter-clockwise.
+    Omit `bbox` to rotate the whole image (any angle). Pass a detection's `box` as `bbox` to rotate
+    just that region (angle must then be a multiple of 90)."""
+    return _call_image_edit_tool("rotate", {"angle": angle, "bbox": bbox})
+
+
+@tool
+def flip(direction: str = "horizontal", bbox: Optional[List[float]] = None) -> str:
+    """Flip the current image. direction is 'horizontal' or 'vertical'.
+    Omit `bbox` to flip the whole image, or pass a detection's `box` to flip just that region."""
+    return _call_image_edit_tool("flip", {"direction": direction, "bbox": bbox})
+
+
+@tool
+def blur(radius: float = 2.0, bbox: Optional[List[float]] = None) -> str:
+    """Apply Gaussian blur to the current image.
+    Omit `bbox` to blur the whole image, or pass a detection's `box` to blur just that region."""
+    return _call_image_edit_tool("blur", {"radius": radius, "bbox": bbox})
+
+
+@tool
+def resize(width: int, height: int, bbox: Optional[List[float]] = None) -> str:
+    """Resize the current image to (width, height).
+    Omit `bbox` to resize the whole image; pass a detection's `box` to stretch just that region
+    to the new size in place."""
+    return _call_image_edit_tool("resize", {"width": width, "height": height, "bbox": bbox})
+
+
+@tool
+def crop(bbox: List[float]) -> str:
+    """Crop out a bbox region of the current image and return it as its own standalone image.
+    `bbox` is required (e.g. a detection's `box`) - the result is the cropped region itself,
+    not composited back into the full image."""
+    return _call_image_edit_tool("crop", {"bbox": bbox})
+
+
+@tool
+def add_noise(amount: float = 0.05, bbox: Optional[List[float]] = None) -> str:
+    """Add salt-and-pepper noise to the current image. `amount` is the fraction of pixels affected (0-1).
+    Omit `bbox` to affect the whole image, or pass a detection's `box` to affect just that region."""
+    return _call_image_edit_tool("add_noise", {"amount": amount, "bbox": bbox})
+
+
 # Registry: map tool name -> tool function
 TOOLS = {
     detect_objects.name: detect_objects,
     show_annotated_image.name: show_annotated_image,
+    rotate.name: rotate,
+    flip.name: flip,
+    blur.name: blur,
+    resize.name: resize,
+    crop.name: crop,
+    add_noise.name: add_noise,
 }
 
 # Initialize a rate limiter (30 Requests per minute baseline, max burst capacity of 2 requests)
@@ -247,7 +385,10 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     iterations = 0
     tools_called: List[str] = []
     prediction_id: Optional[str] = None
+    predicted_image_s3_key: Optional[str] = None
     annotated_image: Optional[str] = None
+    edited_image: Optional[str] = None
+    last_edited_image_s3_key: Optional[str] = None
     image_url = None
     start_time = time.perf_counter()
 
@@ -276,10 +417,15 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
 
         if not response.tool_calls:
             loop_time = round(time.perf_counter() - start_time, 4)
+            if last_edited_image_s3_key:
+                edited_image = download_image_base64(last_edited_image_s3_key) or edited_image
             return {
-                "response": _normalize_response_content(response.content),
+                "response": _strip_markdown_images(_normalize_response_content(response.content)),
                 "prediction_id": prediction_id,
+                "predicted_image_s3_key": predicted_image_s3_key,
                 "annotated_image": annotated_image,
+                "edited_image": edited_image,
+                "current_image_s3_key": _current_image_s3_key.get(),
                 "image_url": image_url,
                 "agent_loop_time_s": loop_time,
                 "iterations": iterations,
@@ -314,22 +460,42 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 if current_id:
                     prediction_id = current_id
                     _current_prediction_id.set(current_id)
-                predicted_image_s3_key = tool_data.get("predicted_image_s3_key")
-                if predicted_image_s3_key:
-                    _current_predicted_image_s3_key.set(predicted_image_s3_key)
+                current_predicted_key = tool_data.get("predicted_image_s3_key")
+                if current_predicted_key:
+                    predicted_image_s3_key = current_predicted_key
+                    _current_predicted_image_s3_key.set(current_predicted_key)
             
             if tool_name == "show_annotated_image":
                 tool_data = json.loads(tool_result.content)
                 image_url = tool_data.get("image_url") or image_url
                 annotated_image = _fetch_annotated_image(prediction_id) or annotated_image
 
+            if tool_name in IMAGE_EDIT_TOOL_NAMES:
+                tool_data = json.loads(tool_result.content)
+                output_key = tool_data.get("output_s3_key")
+                if output_key:
+                    _current_image_s3_key.set(output_key)
+                    last_edited_image_s3_key = output_key
+                    # Any previously computed YOLO annotation is now stale (boxes
+                    # would be misaligned against the edited image) - force a fresh
+                    # detect_objects call if annotations are requested again.
+                    prediction_id = None
+                    predicted_image_s3_key = None
+                    _current_prediction_id.set(None)
+                    _current_predicted_image_s3_key.set(None)
+
     loop_time = round(time.perf_counter() - start_time, 4)
     error_msg = f"⚠️ Agent stopped automatically: Reached safety limit of {max_iterations} iterations without resolving."
     logging.warning(error_msg)
+    if last_edited_image_s3_key:
+        edited_image = download_image_base64(last_edited_image_s3_key) or edited_image
     return {
         "response": error_msg,
         "prediction_id": prediction_id,
+        "predicted_image_s3_key": predicted_image_s3_key,
         "annotated_image": annotated_image,
+        "edited_image": edited_image,
+        "current_image_s3_key": _current_image_s3_key.get(),
         "image_url": image_url,
         "agent_loop_time_s": loop_time,
         "iterations": iterations,
@@ -359,6 +525,9 @@ class ChatMessage(BaseModel):
     role: str                           # "user" or "assistant"
     content: str
     image_base64: Optional[str] = None  # only on user messages that carry an image
+    current_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
+    prediction_id: Optional[str] = None  # echoed back on assistant messages to carry state across turns
+    predicted_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
 
 
 class ChatRequest(BaseModel):
@@ -382,19 +551,45 @@ def chat(request: ChatRequest):
         else:
             lc_messages.append(AIMessage(content=msg.content))
 
+    # The frontend resends the full message history every turn, so a historical
+    # message's image_base64 must not be mistaken for a fresh upload: only the
+    # newest message (last in the list) uploading an image counts as "new".
+    last_message = request.messages[-1] if request.messages else None
+    new_image_uploaded_this_turn = bool(
+        last_message and last_message.role == "user" and last_message.image_base64
+    )
+
     image_s3_key = None
-    if latest_image:
+    prediction_id = None
+    predicted_image_s3_key = None
+    if new_image_uploaded_this_turn:
         try:
             pred_uid = str(uuid4())
             s3_key = build_original_image_key(chat_id, pred_uid)
             image_s3_key = upload_base64_image(latest_image, s3_key)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Failed to upload image to S3: {exc}") from exc
+        # A new image has nothing to do with any prior detection - prediction_id/
+        # predicted_image_s3_key stay None so a fresh detect_objects call is required.
+    else:
+        # No new upload this turn - carry forward the most recent image-state
+        # snapshot from history (current_image_s3_key/prediction_id/predicted_image_s3_key
+        # were all echoed together on the same assistant message). Take all three from
+        # the SAME message rather than independently merging fields from different
+        # messages - an edit clears prediction_id/predicted_image_s3_key on its message,
+        # and independently falling back to an older message's prediction_id there would
+        # resurrect a prediction computed against a since-replaced image.
+        for msg in reversed(request.messages):
+            if msg.current_image_s3_key:
+                image_s3_key = msg.current_image_s3_key
+                prediction_id = msg.prediction_id
+                predicted_image_s3_key = msg.predicted_image_s3_key
+                break
 
     token_img = _current_image_b64.set(latest_image)
     token_img_s3 = _current_image_s3_key.set(image_s3_key)
-    token_pred = _current_prediction_id.set(None) # Reset local state per request context
-    token_predicted_key = _current_predicted_image_s3_key.set(None)
+    token_pred = _current_prediction_id.set(prediction_id)
+    token_predicted_key = _current_predicted_image_s3_key.set(predicted_image_s3_key)
     try:
         agent_payload = run_agent(lc_messages)
         return agent_payload

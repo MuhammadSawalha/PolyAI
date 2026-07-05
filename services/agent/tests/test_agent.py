@@ -75,12 +75,27 @@ def test_run_agent_complete_workflow(monkeypatch):
 
     assert result["response"] == "I found 2 people in the image."
     assert result["prediction_id"] == "prediction-123"
+    assert result["predicted_image_s3_key"] == "chat-1/prediction-123/predicted/image.jpg"
     assert result["annotated_image"] == "mocked_base64_string"
     assert result["image_url"] == "http://localhost:8080/prediction/prediction-123/image"
     assert result["iterations"] == 3
     assert "detect_objects" in result["tools_called"]
     assert "show_annotated_image" in result["tools_called"]
     assert result["tokens_used"]["total"] == 150
+
+
+def test_run_agent_strips_hallucinated_markdown_image(monkeypatch):
+    """A model that hallucinates a markdown image reference in its final text must not have
+    that broken image syntax survive into the response returned to the frontend."""
+    class HallucinatingLLM:
+        def invoke(self, messages):
+            return AIMessage(content="Here is the rotated image:\n![Rotated Image](placeholder.png)")
+
+    monkeypatch.setattr(app, "llm_with_tools", HallucinatingLLM())
+
+    result = app.run_agent([HumanMessage(content="rotate and show me")])
+    assert "![" not in result["response"]
+    assert result["response"] == "Here is the rotated image:"
 
 
 def test_run_agent_context_limit_flag(monkeypatch):
@@ -120,8 +135,42 @@ def test_normalization_utilities():
     list_content = [{"type": "text", "text": "Hello "}, "World!"]
     normalized = app._normalize_response_content(list_content)
     assert normalized == "Hello World!"
-    
+
     assert app._normalize_response_content(404) == "404"
+
+
+def test_strip_markdown_images_removes_single_image():
+    text = "Here is the rotated image:\n![Rotated Image](some-broken-placeholder)"
+    assert app._strip_markdown_images(text) == "Here is the rotated image:"
+
+
+def test_strip_markdown_images_removes_multiple_images():
+    text = "Before ![a](url1) middle ![b](url2) after"
+    result = app._strip_markdown_images(text)
+    assert "![" not in result
+    assert "Before" in result and "middle" in result and "after" in result
+
+
+def test_strip_markdown_images_leaves_normal_text_and_links_alone():
+    text = "The image has been rotated. [See details](http://example.com/prediction/1)"
+    assert app._strip_markdown_images(text) == text
+
+
+def test_strip_markdown_images_noop_on_plain_text():
+    assert app._strip_markdown_images("No images here at all.") == "No images here at all."
+
+
+def test_strip_markdown_images_removes_literal_image_placeholder():
+    text = "Here is the annotated image with the detected objects:\n<image>\nWould you like to make any edits?"
+    result = app._strip_markdown_images(text)
+    assert "<image>" not in result.lower()
+    assert "Here is the annotated image" in result
+    assert "Would you like to make any edits?" in result
+
+
+def test_strip_markdown_images_removes_closing_image_tag_case_insensitive():
+    text = "Done.</Image>"
+    assert app._strip_markdown_images(text) == "Done."
 
 
 def test_build_original_image_key_normalizes_extension():
@@ -227,23 +276,53 @@ def test_show_annotated_image_tool_ordering():
 
 @patch("httpx.Client")
 def test_detect_objects_tool_success(mock_client_class):
-    """Verify execution track of detect_objects tool under valid image state."""
+    """Verify execution track of detect_objects tool under valid image state, including the
+    follow-up GET /prediction/{uid} call that enriches the result with parsed bboxes."""
     app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
-    
+
     mock_client_instance = MagicMock()
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
-    mock_response.raise_for_status = MagicMock()
-    
-    mock_client_instance.post.return_value = mock_response
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+
+    mock_detail_response = MagicMock()
+    mock_detail_response.json.return_value = {
+        "detection_objects": [
+            {"id": 1, "label": "dog", "score": 0.9, "box": "[10.0, 20.0, 30.0, 40.0]"},
+        ]
+    }
+    mock_detail_response.raise_for_status = MagicMock()
+
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_client_instance.get.return_value = mock_detail_response
     mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
     res = json.loads(app.detect_objects.invoke({}))
     assert res["prediction_uid"] == "pred-abc"
+    assert res["detections"] == [{"id": 1, "label": "dog", "score": 0.9, "box": [10.0, 20.0, 30.0, 40.0]}]
     mock_client_instance.post.assert_called_once_with(
         f"{app.YOLO_SERVICE_URL}/predict",
         json={"image_s3_key": "chat-1/prediction-1/original/image.jpg"},
     )
+    mock_client_instance.get.assert_called_once_with(f"{app.YOLO_SERVICE_URL}/prediction/pred-abc")
+
+
+@patch("httpx.Client")
+def test_detect_objects_tool_success_without_prediction_uid(mock_client_class):
+    """If /predict responds without a prediction_uid, no follow-up GET call should happen."""
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    res = json.loads(app.detect_objects.invoke({}))
+    assert "detections" not in res
+    mock_client_instance.get.assert_not_called()
 
 
 @patch("httpx.Client")
@@ -316,3 +395,154 @@ def test_invalid_framework_model_constraints():
         app.MODEL = "unsupported_legacy_model"
         if app.MODEL not in app.ALLOWED_MODELS:
             raise SystemExit("Error path covered.")
+
+
+def test_parse_bbox_valid_json_string():
+    assert app._parse_bbox("[10.0, 20.0, 30.0, 40.0]") == [10.0, 20.0, 30.0, 40.0]
+
+
+def test_parse_bbox_malformed_string_raises():
+    with pytest.raises(ValueError):
+        app._parse_bbox("not json")
+
+
+def test_parse_bbox_wrong_shape_raises():
+    with pytest.raises(ValueError):
+        app._parse_bbox("[1, 2, 3]")
+
+
+IMAGE_EDIT_TOOLS = {
+    "rotate": (app.rotate, {"angle": 90}),
+    "flip": (app.flip, {"direction": "horizontal"}),
+    "blur": (app.blur, {"radius": 2.0}),
+    "resize": (app.resize, {"width": 100, "height": 100}),
+    "crop": (app.crop, {"bbox": [1.0, 2.0, 3.0, 4.0]}),
+    "add_noise": (app.add_noise, {"amount": 0.1}),
+}
+
+
+@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
+def test_image_edit_tool_success(monkeypatch, tool_name):
+    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    monkeypatch.setattr(
+        app, "call_mcp_tool", lambda name, arguments: {"output_s3_key": f"chat-1/pred-1/edited/{name}.png", "width": 10, "height": 10}
+    )
+
+    res = json.loads(tool_fn.invoke(args))
+    assert res["output_s3_key"] == f"chat-1/pred-1/edited/{tool_name}.png"
+
+
+@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
+def test_image_edit_tool_no_current_image(tool_name):
+    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
+    app._current_image_s3_key.set(None)
+
+    res = json.loads(tool_fn.invoke(args))
+    assert "error" in res
+
+
+@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
+def test_image_edit_tool_mcp_call_fails(monkeypatch, tool_name):
+    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    def _raise(name, arguments):
+        raise RuntimeError("img-proc-mcp unreachable")
+
+    monkeypatch.setattr(app, "call_mcp_tool", _raise)
+
+    res = json.loads(tool_fn.invoke(args))
+    assert "error" in res
+    assert "img-proc-mcp unreachable" in res["detail"]
+
+
+class FakeRotateThenBlurLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "rotate", "args": {"angle": 90}, "id": "call_1", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "blur", "args": {"radius": 2.0}, "id": "call_2", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Rotated then blurred the image.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+class FakeImageEditTool:
+    def __init__(self, output_s3_key):
+        self.output_s3_key = output_s3_key
+
+    def invoke(self, tool_call):
+        return type("FakeMessage", (), {"content": json.dumps({"output_s3_key": self.output_s3_key, "width": 10, "height": 10})})()
+
+
+def test_run_agent_chains_image_edits(monkeypatch):
+    """Verify rotate -> blur chaining updates the shared _current_image_s3_key and populates edited_image."""
+    fake_llm = FakeRotateThenBlurLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
+    })
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    result = app.run_agent([HumanMessage(content="rotate then blur")])
+
+    assert result["response"] == "Rotated then blurred the image."
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_b.png"
+    assert result["current_image_s3_key"] == "chat-1/pred-1/edited/blur_b.png"
+    assert app._current_image_s3_key.get() == "chat-1/pred-1/edited/blur_b.png"
+
+
+def test_run_agent_edit_invalidates_stale_annotation(monkeypatch):
+    """A successful edit must clear any prior detect_objects/show_annotated_image state,
+    since bounding boxes and the annotated image would no longer align with the new image."""
+    fake_llm = FakeRotateThenBlurLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
+    })
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_prediction_id.set("stale-prediction")
+    app._current_predicted_image_s3_key.set("chat-1/pred-1/predicted/stale.jpg")
+
+    result = app.run_agent([HumanMessage(content="rotate then blur")])
+
+    assert result["prediction_id"] is None
+    assert result["predicted_image_s3_key"] is None
+    assert app._current_prediction_id.get() is None
+    assert app._current_predicted_image_s3_key.get() is None
+
+
+def test_run_agent_stops_at_max_iterations_populates_edited_image(monkeypatch):
+    """Verify the max-iterations safety fallback still surfaces an edited image if one was produced."""
+    class AlwaysRotateLLM:
+        def invoke(self, messages):
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "rotate", "args": {"angle": 90}, "id": "loop_id", "type": "tool_call"}],
+            )
+
+    monkeypatch.setattr(app, "llm_with_tools", AlwaysRotateLLM())
+    monkeypatch.setattr(app, "TOOLS", {"rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_c.png")})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    result = app.run_agent([HumanMessage(content="Loop")], max_iterations=1)
+    assert result["context_limit_exceeded"] is True
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/rotate_c.png"

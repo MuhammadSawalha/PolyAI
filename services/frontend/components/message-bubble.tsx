@@ -89,6 +89,19 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
             </div>
           )
         )}
+        {message.edited_image && message.edited_image.length > 0 && (
+          <div className="mt-3 block w-full max-w-sm overflow-hidden rounded-lg border border-border bg-muted/40 shadow-sm">
+            <img
+              src={
+                message.edited_image.startsWith("data:")
+                  ? message.edited_image
+                  : `data:image/png;base64,${message.edited_image}`
+              }
+              alt="Edited Image Output"
+              className="w-full h-auto object-contain block"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
