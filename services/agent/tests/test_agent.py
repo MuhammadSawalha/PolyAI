@@ -2,13 +2,18 @@ import os
 import sys
 import pytest
 import json
+import base64
+import httpx
 from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 
 # Set default test environment variables BEFORE importing app to prevent initialization crashes
 os.environ.setdefault("MODEL", "amazon.nova-lite-v1:0")
 os.environ.setdefault("MODEL_PROVIDER", "bedrock_converse")
-os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("AWS_S3_BUCKET", "fake-bucket")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "fake")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "fake")
 
 # Ensure the parent directory is in the path so we can import app
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -46,7 +51,7 @@ class FakeLLMWithTools:
 
 class FakeDetectTool:
     def invoke(self, tool_call):
-        return type("FakeMessage", (), {"content": '{"prediction_uid":"prediction-123"}'})()
+        return type("FakeMessage", (), {"content": '{"prediction_uid":"prediction-123","predicted_image_s3_key":"chat-1/prediction-123/predicted/image.jpg"}'})()
 
 
 class FakeShowImageTool:
@@ -119,6 +124,37 @@ def test_normalization_utilities():
     assert app._normalize_response_content(404) == "404"
 
 
+def test_build_original_image_key_normalizes_extension():
+    key = app.build_original_image_key("chat-1", "prediction-1", "png")
+    assert key == "chat-1/prediction-1/original/image.png"
+
+
+@patch("app.upload_file_bytes", return_value=True)
+def test_upload_base64_image_success(mock_upload_file_bytes):
+    result = app.upload_base64_image("ZmFrZWJhc2U2NHRleHQ=", "chat-1/prediction-1/original/image.jpg")
+    assert result == "chat-1/prediction-1/original/image.jpg"
+    mock_upload_file_bytes.assert_called_once()
+
+
+@patch("app.upload_file_bytes", return_value=False)
+def test_upload_base64_image_failure(mock_upload_file_bytes):
+    with pytest.raises(RuntimeError, match="Failed to upload image to S3 key chat-1/prediction-1/original/image.jpg"):
+        app.upload_base64_image("ZmFrZWJhc2U2NHRleHQ=", "chat-1/prediction-1/original/image.jpg")
+
+    mock_upload_file_bytes.assert_called_once()
+
+
+def test_download_image_base64_none_key():
+    assert app.download_image_base64(None) is None
+
+
+@patch("app.download_file_bytes", return_value=b"fake_binary_image_bytes")
+def test_download_image_base64_success(mock_download_file_bytes):
+    result = app.download_image_base64("chat-1/prediction-123/predicted/image.jpg")
+    assert result == base64.b64encode(b"fake_binary_image_bytes").decode("ascii")
+    mock_download_file_bytes.assert_called_once_with("chat-1/prediction-123/predicted/image.jpg")
+
+
 @patch("httpx.Client")
 def test_fetch_annotated_image_success(mock_client_class):
     """Test successful network retrieval loop inside _fetch_annotated_image."""
@@ -133,6 +169,39 @@ def test_fetch_annotated_image_success(mock_client_class):
 
     result = app._fetch_annotated_image("valid-id")
     assert result is not None
+
+
+@patch("app.download_image_base64", return_value="mocked_base64_from_s3")
+def test_fetch_annotated_image_from_s3_key(mock_download_image_base64):
+    token = app._current_predicted_image_s3_key.set("chat-1/prediction-123/predicted/image.jpg")
+    try:
+        result = app._fetch_annotated_image("valid-id")
+    finally:
+        app._current_predicted_image_s3_key.reset(token)
+
+    assert result == "mocked_base64_from_s3"
+    mock_download_image_base64.assert_called_once_with("chat-1/prediction-123/predicted/image.jpg")
+
+
+@patch("app.download_image_base64", side_effect=RuntimeError("S3 read failed"))
+@patch("httpx.Client")
+def test_fetch_annotated_image_s3_exception_falls_back_to_http(mock_client_class, mock_download_image_base64):
+    mock_client_instance = MagicMock()
+    mock_response = MagicMock()
+    mock_response.content = b"fake_binary_image_bytes"
+    mock_response.raise_for_status = MagicMock()
+    mock_client_instance.get.return_value = mock_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    token = app._current_predicted_image_s3_key.set("chat-1/prediction-123/predicted/image.jpg")
+    try:
+        result = app._fetch_annotated_image("prediction-123")
+    finally:
+        app._current_predicted_image_s3_key.reset(token)
+
+    assert result is not None
+    mock_download_image_base64.assert_called_once_with("chat-1/prediction-123/predicted/image.jpg")
+    mock_client_instance.get.assert_called_once_with(f"{app.YOLO_SERVICE_URL}/prediction/prediction-123/image")
 
 
 def test_fetch_annotated_image_exceptions():
@@ -159,23 +228,84 @@ def test_show_annotated_image_tool_ordering():
 @patch("httpx.Client")
 def test_detect_objects_tool_success(mock_client_class):
     """Verify execution track of detect_objects tool under valid image state."""
-    app._current_image_b64.set("ZmFrZWJhc2U2NHRleHQ=")  # Valid base64 encoding for 'fakebase64text'
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
     
     mock_client_instance = MagicMock()
     mock_response = MagicMock()
-    mock_response.json.return_value = {"prediction_id": "pred-abc", "objects": []}
+    mock_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
     mock_response.raise_for_status = MagicMock()
     
     mock_client_instance.post.return_value = mock_response
     mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
     res = json.loads(app.detect_objects.invoke({}))
-    assert res["prediction_id"] == "pred-abc"
+    assert res["prediction_uid"] == "pred-abc"
+    mock_client_instance.post.assert_called_once_with(
+        f"{app.YOLO_SERVICE_URL}/predict",
+        json={"image_s3_key": "chat-1/prediction-1/original/image.jpg"},
+    )
+
+
+@patch("httpx.Client")
+def test_detect_objects_tool_yolo_http_error(mock_client_class):
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 502
+    mock_response.json.return_value = {"detail": "Failed to download source image from S3: NoSuchKey"}
+
+    request = httpx.Request("POST", f"{app.YOLO_SERVICE_URL}/predict")
+    error = httpx.HTTPStatusError("bad gateway", request=request, response=mock_response)
+    mock_response.raise_for_status.side_effect = error
+    mock_client_instance.post.return_value = mock_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    res = json.loads(app.detect_objects.invoke({}))
+    assert res["error"] == "YOLO service request failed."
+    assert res["status_code"] == 502
+    assert "Failed to download source image from S3" in res["detail"]
+
+
+@patch("httpx.Client")
+def test_detect_objects_tool_yolo_http_error_text_fallback(mock_client_class):
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 502
+    mock_response.json.side_effect = ValueError("not json")
+    mock_response.text = "plain upstream error"
+
+    request = httpx.Request("POST", f"{app.YOLO_SERVICE_URL}/predict")
+    error = httpx.HTTPStatusError("bad gateway", request=request, response=mock_response)
+    mock_response.raise_for_status.side_effect = error
+    mock_client_instance.post.return_value = mock_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    res = json.loads(app.detect_objects.invoke({}))
+    assert res["error"] == "YOLO service request failed."
+    assert res["status_code"] == 502
+    assert res["detail"] == "plain upstream error"
+
+
+@patch("httpx.Client")
+def test_detect_objects_tool_yolo_request_error(mock_client_class):
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    request = httpx.Request("POST", f"{app.YOLO_SERVICE_URL}/predict")
+    mock_client_instance.post.side_effect = httpx.RequestError("connection refused", request=request)
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    res = json.loads(app.detect_objects.invoke({}))
+    assert res["error"] == "YOLO service is unavailable."
+    assert "connection refused" in res["detail"]
 
 
 def test_detect_objects_missing_image_context():
     """Verify error behavior if detect_objects runs with an empty thread state context."""
-    app._current_image_b64.set(None)
+    app._current_image_s3_key.set(None)
     error_response = json.loads(app.detect_objects.invoke({}))
     assert "error" in error_response
 
