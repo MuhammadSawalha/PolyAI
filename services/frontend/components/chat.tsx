@@ -68,6 +68,7 @@ export default function Chat() {
         prediction_id,
         predicted_image_s3_key,
         image_url,
+        tool_trace,
       } = await sendMessage(next);
 
       setMessages([
@@ -81,6 +82,7 @@ export default function Chat() {
           ...(prediction_id ? { prediction_id } : {}),
           ...(predicted_image_s3_key ? { predicted_image_s3_key } : {}),
           ...(image_url ? { image_url } : {}),
+          ...(tool_trace ? { tool_trace } : {}),
         },
       ]);
     } catch (err) {

@@ -10,6 +10,7 @@ export interface SendMessageResult {
   prediction_id: string | null;
   predicted_image_s3_key: string | null;
   image_url: string | null;
+  tool_trace: string | null;
 }
 
 export async function sendMessage(
@@ -33,5 +34,6 @@ export async function sendMessage(
     prediction_id: data.prediction_id ?? null,
     predicted_image_s3_key: data.predicted_image_s3_key ?? null,
     image_url: data.image_url ?? null,
+    tool_trace: data.tool_trace ?? null,
   };
 }

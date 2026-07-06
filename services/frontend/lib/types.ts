@@ -8,4 +8,5 @@ export interface ChatMessage {
   prediction_id?: string | null;
   predicted_image_s3_key?: string | null;
   image_url?: string;
+  tool_trace?: string | null;
 }

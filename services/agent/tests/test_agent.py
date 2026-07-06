@@ -5,7 +5,8 @@ import json
 import base64
 import httpx
 from unittest.mock import MagicMock, patch
-from langchain_core.messages import AIMessage, HumanMessage
+from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 # Set default test environment variables BEFORE importing app to prevent initialization crashes
 os.environ.setdefault("MODEL", "amazon.nova-lite-v1:0")
@@ -546,3 +547,151 @@ def test_run_agent_stops_at_max_iterations_populates_edited_image(monkeypatch):
     result = app.run_agent([HumanMessage(content="Loop")], max_iterations=1)
     assert result["context_limit_exceeded"] is True
     assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/rotate_c.png"
+
+
+def test_serialize_and_reconstruct_tool_trace_roundtrip():
+    """The trace serializer/deserializer must faithfully restore the real
+    AIMessage(tool_calls=...)/ToolMessage sequence, not just the final text."""
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}],
+        ),
+        ToolMessage(content='{"detections": [{"box": [1, 2, 3, 4]}]}', tool_call_id="call_1", name="detect_objects"),
+        AIMessage(content="Detected 1 object."),
+    ]
+
+    trace = app._serialize_tool_trace(messages)
+    restored = app._reconstruct_trace_messages(trace)
+
+    assert len(restored) == 3
+    assert isinstance(restored[0], AIMessage)
+    assert restored[0].tool_calls == messages[0].tool_calls
+    assert isinstance(restored[1], ToolMessage)
+    assert restored[1].content == messages[1].content
+    assert restored[1].tool_call_id == "call_1"
+    assert restored[1].name == "detect_objects"
+    assert isinstance(restored[2], AIMessage)
+    assert restored[2].content == "Detected 1 object."
+
+
+def test_serialize_tool_trace_returns_none_when_no_new_messages():
+    assert app._serialize_tool_trace([]) is None
+
+
+class FakeDetectObjectsTool:
+    def invoke(self, tool_call):
+        return type("FakeMessage", (), {"content": json.dumps({
+            "prediction_uid": "pred-1",
+            "detections": [
+                {"label": "person", "score": 0.9, "box": [1, 2, 3, 4]},
+                {"label": "person", "score": 0.85, "box": [5, 6, 7, 8]},
+            ],
+        })})()
+
+
+class CapturingLLM:
+    """Fake LLM that records every `messages` list it was invoked with, so tests
+    can assert exactly what history was reconstructed for a given turn."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = 0
+        self.received_messages = []
+
+    def invoke(self, messages):
+        self.received_messages.append(messages)
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
+
+
+def test_chat_endpoint_restores_real_tool_trace_on_followup_turn(monkeypatch):
+    """Reproduces the reported bug: after 'blur the second person from the left' succeeds,
+    a follow-up 'blur the first one from the left' must still see the real detect_objects/blur
+    tool-call trace from the previous turn (not a flattened text-only history), so the LLM has
+    the box coordinates and tool-use context needed to act instead of skipping the tool call."""
+    client = TestClient(app.app)
+
+    turn1_llm = CapturingLLM([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "blur", "args": {"radius": 2.0, "bbox": [5, 6, 7, 8]}, "id": "call_2", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="The second person from the left has been blurred.",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+    ])
+    monkeypatch.setattr(app, "llm_with_tools", turn1_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "detect_objects": FakeDetectObjectsTool(),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_1.jpg"),
+    })
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+    monkeypatch.setattr(app, "upload_base64_image", lambda image_b64, object_key: object_key)
+
+    resp1 = client.post("/chat", json={
+        "messages": [
+            {"role": "user", "content": "blur the second person from the left", "image_base64": base64.b64encode(b"fake").decode()},
+        ]
+    })
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["tool_trace"] is not None
+    trace_events = json.loads(data1["tool_trace"])
+    assert [e["role"] for e in trace_events] == ["ai", "tool", "ai", "tool", "ai"]
+
+    turn2_llm = CapturingLLM([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "blur", "args": {"radius": 2.0, "bbox": [1, 2, 3, 4]}, "id": "call_3", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="The first person from the left has been blurred too.",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+    ])
+    monkeypatch.setattr(app, "llm_with_tools", turn2_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_2.jpg"),
+    })
+
+    resp2 = client.post("/chat", json={
+        "messages": [
+            {"role": "user", "content": "blur the second person from the left", "image_base64": base64.b64encode(b"fake").decode()},
+            {
+                "role": "assistant",
+                "content": data1["response"],
+                "current_image_s3_key": data1["current_image_s3_key"],
+                "prediction_id": data1["prediction_id"],
+                "predicted_image_s3_key": data1["predicted_image_s3_key"],
+                "tool_trace": data1["tool_trace"],
+            },
+            {"role": "user", "content": "blur the first one from the left"},
+        ]
+    })
+    assert resp2.status_code == 200
+    assert resp2.json()["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_2.jpg"
+
+    # The reconstructed history handed to the LLM on turn 2 must contain the real
+    # tool_calls/ToolMessage sequence from turn 1 - not a single flattened text message.
+    first_call_messages = turn2_llm.received_messages[0]
+    tool_call_names = [
+        tc["name"]
+        for m in first_call_messages
+        if isinstance(m, AIMessage) and m.tool_calls
+        for tc in m.tool_calls
+    ]
+    assert "detect_objects" in tool_call_names
+    assert "blur" in tool_call_names
+
+    tool_message_contents = [m.content for m in first_call_messages if isinstance(m, ToolMessage)]
+    assert any("detections" in c for c in tool_message_contents)

@@ -77,6 +77,16 @@ SYSTEM_PROMPT = (
     "Note: `rotate` only accepts angles that are multiples of 90 when `bbox` is given (whole-image rotation allows any angle). "
     "`crop` requires a `bbox` and returns just that cropped region as the final image, not composited back into the full picture. "
     "\n"
+    "DETECTIONS NEVER CARRY OVER BETWEEN TURNS: you do not retain the raw `detections`/`box` data from any earlier turn in this conversation - "
+    "only the plain-language description of what happened persists, never the coordinates themselves. "
+    "Any earlier detection is also invalid once the image has been edited (positions and dimensions can shift). "
+    "So whenever a NEW message asks you to identify an object by position (e.g. 'the Nth <label> from the left/right/top/bottom') for an edit, "
+    "you must call `detect_objects` again in THIS turn to get fresh box coordinates - even if you or an earlier turn already detected objects earlier in this same conversation. "
+    "Never assume you remember box coordinates from earlier turns, and never skip straight to an editing tool using positions you have not freshly detected in this turn. "
+    "\n"
+    "NEVER claim in your response that an image was rotated, flipped, blurred, resized, cropped, or had noise added unless you actually called that tool in THIS turn - "
+    "do not describe a hypothetical or previously-done edit as if it just happened. If the user's current message asks for an edit you have not yet performed in this turn, call the tool before answering. "
+    "\n"
     "NEVER emit markdown image syntax like `![alt](url)` or any inline image link for any image (annotated or edited) - "
     "you have no real URL or image bytes to put there, so it will only ever render broken. "
     "Every image (annotated_image, edited_image, image_url) is delivered automatically out-of-band and displayed by the frontend "
@@ -100,6 +110,7 @@ class AgentChatResponse(BaseModel):
     iterations: int
     tools_called: List[str]
     context_limit_exceeded: bool
+    tool_trace: Optional[str] = None
     tokens_used: TokenUsage  # Added token usage
 
 
@@ -169,6 +180,49 @@ def _normalize_response_content(content) -> str:
     if isinstance(content, str):
         return content
     return str(content)
+
+
+def _serialize_tool_trace(new_messages: list) -> Optional[str]:
+    """Serialize the AIMessage/ToolMessage sequence produced during a single run_agent
+    call so the next HTTP turn can restore the real tool-call trace (which tools ran,
+    with what args, and what they returned) instead of losing it to a flattened
+    text-only history reconstruction."""
+    if not new_messages:
+        return None
+    events = []
+    for m in new_messages:
+        if isinstance(m, ToolMessage):
+            events.append({
+                "role": "tool",
+                "name": m.name,
+                "tool_call_id": m.tool_call_id,
+                "content": m.content if isinstance(m.content, str) else json.dumps(m.content),
+            })
+        elif isinstance(m, AIMessage):
+            events.append({
+                "role": "ai",
+                "content": _normalize_response_content(m.content),
+                "tool_calls": m.tool_calls or [],
+            })
+    return json.dumps(events)
+
+
+def _reconstruct_trace_messages(trace_json: str) -> list:
+    """Inverse of _serialize_tool_trace: rebuilds the real AIMessage/ToolMessage
+    sequence from a previous turn so the LLM sees actual prior tool calls and
+    results (e.g. detect_objects box coordinates) rather than a flattened summary."""
+    events = json.loads(trace_json)
+    restored = []
+    for ev in events:
+        if ev["role"] == "ai":
+            restored.append(AIMessage(content=ev.get("content", ""), tool_calls=ev.get("tool_calls", [])))
+        elif ev["role"] == "tool":
+            restored.append(ToolMessage(
+                content=ev.get("content", ""),
+                tool_call_id=ev.get("tool_call_id", ""),
+                name=ev.get("name"),
+            ))
+    return restored
 
 
 def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
@@ -379,6 +433,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
       3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + history
+    initial_len = len(messages)
     iterations = 0
     tools_called: List[str] = []
     prediction_id: Optional[str] = None
@@ -428,6 +483,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 "iterations": iterations,
                 "tools_called": tools_called,
                 "context_limit_exceeded": context_limit_exceeded,
+                "tool_trace": _serialize_tool_trace(messages[initial_len:]),
                 "tokens_used": {
                     "input": total_input_tokens,
                     "output": total_output_tokens,
@@ -498,6 +554,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "iterations": iterations,
         "tools_called": tools_called,
         "context_limit_exceeded": True,
+        "tool_trace": _serialize_tool_trace(messages[initial_len:]),
         "tokens_used": {
             "input": total_input_tokens,
             "output": total_output_tokens,
@@ -525,6 +582,7 @@ class ChatMessage(BaseModel):
     current_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
     prediction_id: Optional[str] = None  # echoed back on assistant messages to carry state across turns
     predicted_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
+    tool_trace: Optional[str] = None  # echoed back on assistant messages to restore the real tool-call/result history
 
 
 class ChatRequest(BaseModel):
@@ -546,7 +604,10 @@ def chat(request: ChatRequest):
                 content = msg.content
             lc_messages.append(HumanMessage(content=content))
         else:
-            lc_messages.append(AIMessage(content=msg.content))
+            if msg.tool_trace:
+                lc_messages.extend(_reconstruct_trace_messages(msg.tool_trace))
+            else:
+                lc_messages.append(AIMessage(content=msg.content))
 
     # The frontend resends the full message history every turn, so a historical
     # message's image_base64 must not be mistaken for a fresh upload: only the
