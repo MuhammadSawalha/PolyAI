@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   frontend:
-    image: muhammadsawalha/frontend-service:0.0.1
+    image: muhammadsawalha/frontend-service:${FRONTEND_IMAGE_TAG:-0.0.1}
     container_name: frontend
     ports:
       - "3000:3000"
@@ -12,7 +12,7 @@ services:
       - polyai-net
 
   agent:
-    image: muhammadsawalha/agent-service:0.0.1
+    image: muhammadsawalha/agent-service:${AGENT_IMAGE_TAG:-0.0.1}
     container_name: agent
     ports:
       - "8000:8000"
@@ -31,7 +31,7 @@ services:
       - polyai-net
 
   yolo:
-    image: muhammadsawalha/yolo-service:0.0.1
+    image: muhammadsawalha/yolo-service:${YOLO_IMAGE_TAG:-0.0.1}
     container_name: yolo
     ports:
       - "8080:8080"
@@ -39,7 +39,7 @@ services:
       - polyai-net
 
   img-proc-mcp:
-    image: muhammadsawalha/img-proc-mcp-service:0.0.1
+    image: muhammadsawalha/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG:-0.0.1}
     container_name: img-proc-mcp
     ports:
       - "9000:9000"
@@ -49,6 +49,24 @@ services:
       - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    networks:
+      - polyai-net
+      - monitoring-net
 
   prometheus:
     image: prom/prometheus:latest
@@ -60,6 +78,7 @@ services:
       - prometheus_data:/prometheus
     depends_on:
       - yolo
+      - node-exporter
     networks:
       - monitoring-net
       - polyai-net
