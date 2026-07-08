@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import pytest
@@ -19,6 +20,18 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "fake")
 # Ensure the parent directory is in the path so we can import app
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import app
+
+
+def run_async(coro):
+    """Drive a coroutine with no real suspension points (test doubles only, no actual I/O)
+    to completion in the CURRENT context. Unlike asyncio.run()/run_until_complete(), which
+    wrap the coroutine in a Task and copy contextvars, this executes it directly so
+    ContextVar.set() calls made inside (e.g. by run_agent) are visible to the calling test."""
+    try:
+        coro.send(None)
+    except StopIteration as exc:
+        return exc.value
+    raise RuntimeError("coroutine unexpectedly suspended - it needs a real event loop")
 
 
 class FakeLLMWithTools:
@@ -51,12 +64,12 @@ class FakeLLMWithTools:
 
 
 class FakeDetectTool:
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": '{"prediction_uid":"prediction-123","predicted_image_s3_key":"chat-1/prediction-123/predicted/image.jpg"}'})()
 
 
 class FakeShowImageTool:
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": '{"image_url":"http://localhost:8080/prediction/prediction-123/image"}'})()
 
 
@@ -72,7 +85,7 @@ def test_run_agent_complete_workflow(monkeypatch):
     monkeypatch.setattr(app, "_fetch_annotated_image", lambda pid: "mocked_base64_string")
     monkeypatch.setattr(app, "MAX_INPUT_TOKENS", 500)
 
-    result = app.run_agent([HumanMessage(content="Detect and show image")])
+    result = run_async(app.run_agent([HumanMessage(content="Detect and show image")]))
 
     assert result["response"] == "I found 2 people in the image."
     assert result["prediction_id"] == "prediction-123"
@@ -94,7 +107,7 @@ def test_run_agent_strips_hallucinated_markdown_image(monkeypatch):
 
     monkeypatch.setattr(app, "llm_with_tools", HallucinatingLLM())
 
-    result = app.run_agent([HumanMessage(content="rotate and show me")])
+    result = run_async(app.run_agent([HumanMessage(content="rotate and show me")]))
     assert "![" not in result["response"]
     assert result["response"] == "Here is the rotated image:"
 
@@ -110,7 +123,7 @@ def test_run_agent_context_limit_flag(monkeypatch):
     monkeypatch.setattr(app, "llm_with_tools", HighTokenLLM())
     monkeypatch.setattr(app, "MAX_INPUT_TOKENS", 500)
 
-    result = app.run_agent([HumanMessage(content="Hello")])
+    result = run_async(app.run_agent([HumanMessage(content="Hello")]))
     assert result["context_limit_exceeded"] is True
 
 
@@ -126,7 +139,7 @@ def test_run_agent_stops_at_max_iterations(monkeypatch):
     monkeypatch.setattr(app, "llm_with_tools", AlwaysToolCallingLLM())
     monkeypatch.setattr(app, "TOOLS", {"detect_objects": FakeDetectTool()})
 
-    result = app.run_agent([HumanMessage(content="Loop")], max_iterations=1)
+    result = run_async(app.run_agent([HumanMessage(content="Loop")], max_iterations=1))
     assert result["context_limit_exceeded"] is True
     assert result["iterations"] == 1
 
@@ -412,52 +425,6 @@ def test_parse_bbox_wrong_shape_raises():
         app._parse_bbox("[1, 2, 3]")
 
 
-IMAGE_EDIT_TOOLS = {
-    "rotate": (app.rotate, {"angle": 90}),
-    "flip": (app.flip, {"direction": "horizontal"}),
-    "blur": (app.blur, {"radius": 2.0}),
-    "resize": (app.resize, {"width": 100, "height": 100}),
-    "crop": (app.crop, {"bbox": [1.0, 2.0, 3.0, 4.0]}),
-    "add_noise": (app.add_noise, {"amount": 0.1}),
-}
-
-
-@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
-def test_image_edit_tool_success(monkeypatch, tool_name):
-    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
-    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
-    monkeypatch.setattr(
-        app, "call_mcp_tool", lambda name, arguments: {"output_s3_key": f"chat-1/pred-1/edited/{name}.png", "width": 10, "height": 10}
-    )
-
-    res = json.loads(tool_fn.invoke(args))
-    assert res["output_s3_key"] == f"chat-1/pred-1/edited/{tool_name}.png"
-
-
-@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
-def test_image_edit_tool_no_current_image(tool_name):
-    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
-    app._current_image_s3_key.set(None)
-
-    res = json.loads(tool_fn.invoke(args))
-    assert "error" in res
-
-
-@pytest.mark.parametrize("tool_name", IMAGE_EDIT_TOOLS.keys())
-def test_image_edit_tool_mcp_call_fails(monkeypatch, tool_name):
-    tool_fn, args = IMAGE_EDIT_TOOLS[tool_name]
-    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
-
-    def _raise(name, arguments):
-        raise RuntimeError("img-proc-mcp unreachable")
-
-    monkeypatch.setattr(app, "call_mcp_tool", _raise)
-
-    res = json.loads(tool_fn.invoke(args))
-    assert "error" in res
-    assert "img-proc-mcp unreachable" in res["detail"]
-
-
 class FakeRotateThenBlurLLM:
     def __init__(self):
         self.calls = 0
@@ -485,7 +452,7 @@ class FakeImageEditTool:
     def __init__(self, output_s3_key):
         self.output_s3_key = output_s3_key
 
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": json.dumps({"output_s3_key": self.output_s3_key, "width": 10, "height": 10})})()
 
 
@@ -497,10 +464,11 @@ def test_run_agent_chains_image_edits(monkeypatch):
         "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
         "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
     })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate", "blur"})
     monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
 
     app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
-    result = app.run_agent([HumanMessage(content="rotate then blur")])
+    result = run_async(app.run_agent([HumanMessage(content="rotate then blur")]))
 
     assert result["response"] == "Rotated then blurred the image."
     assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_b.png"
@@ -517,13 +485,14 @@ def test_run_agent_edit_invalidates_stale_annotation(monkeypatch):
         "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
         "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
     })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate", "blur"})
     monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
 
     app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
     app._current_prediction_id.set("stale-prediction")
     app._current_predicted_image_s3_key.set("chat-1/pred-1/predicted/stale.jpg")
 
-    result = app.run_agent([HumanMessage(content="rotate then blur")])
+    result = run_async(app.run_agent([HumanMessage(content="rotate then blur")]))
 
     assert result["prediction_id"] is None
     assert result["predicted_image_s3_key"] is None
@@ -542,9 +511,10 @@ def test_run_agent_stops_at_max_iterations_populates_edited_image(monkeypatch):
 
     monkeypatch.setattr(app, "llm_with_tools", AlwaysRotateLLM())
     monkeypatch.setattr(app, "TOOLS", {"rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_c.png")})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate"})
     monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
 
-    result = app.run_agent([HumanMessage(content="Loop")], max_iterations=1)
+    result = run_async(app.run_agent([HumanMessage(content="Loop")], max_iterations=1))
     assert result["context_limit_exceeded"] is True
     assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/rotate_c.png"
 
@@ -580,7 +550,7 @@ def test_serialize_tool_trace_returns_none_when_no_new_messages():
 
 
 class FakeDetectObjectsTool:
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": json.dumps({
             "prediction_uid": "pred-1",
             "detections": [
@@ -634,6 +604,7 @@ def test_chat_endpoint_restores_real_tool_trace_on_followup_turn(monkeypatch):
         "detect_objects": FakeDetectObjectsTool(),
         "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_1.jpg"),
     })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"blur"})
     monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
     monkeypatch.setattr(app, "upload_base64_image", lambda image_b64, object_key: object_key)
 

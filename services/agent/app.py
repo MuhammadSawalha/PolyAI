@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -26,12 +27,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel
 
 from s3 import download_file_bytes, upload_file_bytes
-from mcp_client import call_mcp_tool
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
+IMG_PROC_MCP_URL = os.environ.get("IMG_PROC_MCP_URL", "http://localhost:9000/mcp")
 MODEL = os.environ.get("MODEL")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock_converse")
@@ -119,8 +121,6 @@ _current_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_image_s3_
 _current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
 _current_predicted_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_predicted_image_s3_key", default=None)
 
-IMAGE_EDIT_TOOL_NAMES = {"rotate", "flip", "blur", "resize", "crop", "add_noise"}
-
 
 def _parse_bbox(box_str: str) -> List[float]:
     try:
@@ -180,6 +180,19 @@ def _normalize_response_content(content) -> str:
     if isinstance(content, str):
         return content
     return str(content)
+
+
+def _extract_tool_data(tool_result) -> dict:
+    """Parse a tool's structured result, whether it came from a local `@tool` (plain JSON
+    string content) or an MCP-discovered tool, which returns `content` as a list of content
+    blocks plus a separate `.artifact["structured_content"]` dict."""
+    artifact = getattr(tool_result, "artifact", None)
+    if isinstance(artifact, dict) and isinstance(artifact.get("structured_content"), dict):
+        return artifact["structured_content"]
+    try:
+        return json.loads(_normalize_response_content(tool_result.content))
+    except (TypeError, json.JSONDecodeError):
+        return {}
 
 
 def _serialize_tool_trace(new_messages: list) -> Optional[str]:
@@ -315,74 +328,6 @@ def detect_objects() -> str:
         })
 
 
-def _call_image_edit_tool(tool_name: str, arguments: dict) -> str:
-    image_s3_key = _current_image_s3_key.get()
-    if not image_s3_key:
-        return json.dumps({"error": "No image available to edit. Upload an image first."})
-    try:
-        result = call_mcp_tool(tool_name, {"image_s3_key": image_s3_key, **arguments})
-    except Exception as exc:
-        return json.dumps({"error": "img-proc-mcp request failed.", "detail": str(exc)})
-    return json.dumps(result)
-
-
-@tool
-def rotate(angle: float, bbox: Optional[List[float]] = None) -> str:
-    """Rotate the current image by `angle` degrees counter-clockwise.
-    Omit `bbox` to rotate the whole image (any angle). Pass a detection's `box` as `bbox` to rotate
-    just that region (angle must then be a multiple of 90)."""
-    return _call_image_edit_tool("rotate", {"angle": angle, "bbox": bbox})
-
-
-@tool
-def flip(direction: str = "horizontal", bbox: Optional[List[float]] = None) -> str:
-    """Flip the current image. direction is 'horizontal' or 'vertical'.
-    Omit `bbox` to flip the whole image, or pass a detection's `box` to flip just that region."""
-    return _call_image_edit_tool("flip", {"direction": direction, "bbox": bbox})
-
-
-@tool
-def blur(radius: float = 2.0, bbox: Optional[List[float]] = None) -> str:
-    """Apply Gaussian blur to the current image.
-    Omit `bbox` to blur the whole image, or pass a detection's `box` to blur just that region."""
-    return _call_image_edit_tool("blur", {"radius": radius, "bbox": bbox})
-
-
-@tool
-def resize(width: int, height: int, bbox: Optional[List[float]] = None) -> str:
-    """Resize the current image to (width, height).
-    Omit `bbox` to resize the whole image; pass a detection's `box` to stretch just that region
-    to the new size in place."""
-    return _call_image_edit_tool("resize", {"width": width, "height": height, "bbox": bbox})
-
-
-@tool
-def crop(bbox: List[float]) -> str:
-    """Crop out a bbox region of the current image and return it as its own standalone image.
-    `bbox` is required (e.g. a detection's `box`) - the result is the cropped region itself,
-    not composited back into the full image."""
-    return _call_image_edit_tool("crop", {"bbox": bbox})
-
-
-@tool
-def add_noise(amount: float = 0.05, bbox: Optional[List[float]] = None) -> str:
-    """Add salt-and-pepper noise to the current image. `amount` is the fraction of pixels affected (0-1).
-    Omit `bbox` to affect the whole image, or pass a detection's `box` to affect just that region."""
-    return _call_image_edit_tool("add_noise", {"amount": amount, "bbox": bbox})
-
-
-# Registry: map tool name -> tool function
-TOOLS = {
-    detect_objects.name: detect_objects,
-    show_annotated_image.name: show_annotated_image,
-    rotate.name: rotate,
-    flip.name: flip,
-    blur.name: blur,
-    resize.name: resize,
-    crop.name: crop,
-    add_noise.name: add_noise,
-}
-
 # Initialize a rate limiter (30 Requests per minute baseline, max burst capacity of 2 requests)
 rate_limiter = InMemoryRateLimiter(
     requests_per_second=0.5,      # Add credit for 1 request every 2 seconds
@@ -394,10 +339,33 @@ rate_limiter = InMemoryRateLimiter(
 llm = init_chat_model(
     MODEL,
     model_provider=MODEL_PROVIDER,
-    region_name=AWS_REGION, 
-    temperature=0, 
+    region_name=AWS_REGION,
+    temperature=0,
     rate_limiter=rate_limiter
 )
+
+# Discover the image-editing tools (rotate/flip/blur/resize/crop/add_noise) directly from the
+# img-proc-mcp server instead of hand-writing local proxy tools for each of them.
+mcp_client = MultiServerMCPClient({
+    "img-proc": {
+        "url": IMG_PROC_MCP_URL,
+        "transport": "http",
+    }
+})
+try:
+    img_edit_tools = asyncio.run(mcp_client.get_tools())
+except Exception as exc:
+    logging.warning(f"Failed to discover tools from img-proc-mcp at {IMG_PROC_MCP_URL}: {exc}")
+    img_edit_tools = []
+IMAGE_EDIT_TOOL_NAMES = {t.name for t in img_edit_tools}
+
+# Registry: map tool name -> tool function
+TOOLS = {
+    detect_objects.name: detect_objects,
+    show_annotated_image.name: show_annotated_image,
+    **{t.name: t for t in img_edit_tools},
+}
+
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 # Capability check
@@ -425,14 +393,25 @@ else:
     )
 
 
-def run_agent(history: list, max_iterations: int = 10) -> dict:
+async def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
     Simple ReAct loop with an infinite loop safety guard:
       1. Send messages to the LLM.
       2. If the LLM requests tool calls, execute them and append results.
       3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + history
+    current_key = _current_image_s3_key.get()
+    if current_key:
+        image_context = (
+            f"\nCURRENT IMAGE: image_s3_key = \"{current_key}\". Every image-editing tool call "
+            "(rotate, flip, blur, resize, crop, add_noise) requires this exact `image_s3_key` argument. "
+            "Each edit returns a new `output_s3_key` - if you chain multiple edits in the same turn "
+            "(e.g. rotate then blur), pass the previous edit's `output_s3_key` as the next call's "
+            "`image_s3_key`, not the original."
+        )
+    else:
+        image_context = "\nNo image is currently available - if the user asks for an edit, tell them to upload one first."
+    messages = [SystemMessage(content=SYSTEM_PROMPT + image_context)] + history
     initial_len = len(messages)
     iterations = 0
     tools_called: List[str] = []
@@ -494,7 +473,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         for tool_call in response.tool_calls:
             tool_name = tool_call.get("name")
             tool_fn = TOOLS[tool_name]
-            tool_result = tool_fn.invoke(tool_call)
+            tool_result = await tool_fn.ainvoke(tool_call)
 
             tool_output = tool_result.content if hasattr(tool_result, "content") else str(tool_result)
             tool_message = ToolMessage(
@@ -508,7 +487,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 tools_called.append(tool_name)
 
             if tool_name == "detect_objects":
-                tool_data = json.loads(tool_result.content)
+                tool_data = _extract_tool_data(tool_result)
                 current_id = tool_data.get("prediction_id") or tool_data.get("prediction_uid")
                 if current_id:
                     prediction_id = current_id
@@ -519,12 +498,12 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                     _current_predicted_image_s3_key.set(current_predicted_key)
             
             if tool_name == "show_annotated_image":
-                tool_data = json.loads(tool_result.content)
+                tool_data = _extract_tool_data(tool_result)
                 image_url = tool_data.get("image_url") or image_url
                 annotated_image = _fetch_annotated_image(prediction_id) or annotated_image
 
             if tool_name in IMAGE_EDIT_TOOL_NAMES:
-                tool_data = json.loads(tool_result.content)
+                tool_data = _extract_tool_data(tool_result)
                 output_key = tool_data.get("output_s3_key")
                 if output_key:
                     _current_image_s3_key.set(output_key)
@@ -590,7 +569,7 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/chat", response_model=AgentChatResponse)
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest):
     lc_messages = []
     latest_image = None
     chat_id = str(uuid4())
@@ -649,7 +628,7 @@ def chat(request: ChatRequest):
     token_pred = _current_prediction_id.set(prediction_id)
     token_predicted_key = _current_predicted_image_s3_key.set(predicted_image_s3_key)
     try:
-        agent_payload = run_agent(lc_messages)
+        agent_payload = await run_agent(lc_messages)
         return agent_payload
     finally:
         _current_image_b64.reset(token_img)
