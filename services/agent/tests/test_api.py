@@ -216,6 +216,7 @@ def test_chat_endpoint_new_image_overrides_carried_forward_state(mock_run_agent,
 def _fake_run_agent_capturing_context(captured: dict):
     def fake_run_agent(history):
         captured["current_image_s3_key"] = app_module._current_image_s3_key.get()
+        captured["original_image_s3_key"] = app_module._current_original_image_s3_key.get()
         captured["prediction_id"] = app_module._current_prediction_id.get()
         captured["predicted_image_s3_key"] = app_module._current_predicted_image_s3_key.get()
         return {
@@ -225,6 +226,7 @@ def _fake_run_agent_capturing_context(captured: dict):
             "annotated_image": None,
             "edited_image": None,
             "current_image_s3_key": captured["current_image_s3_key"],
+            "original_image_s3_key": captured["original_image_s3_key"],
             "image_url": None,
             "agent_loop_time_s": 0.1,
             "iterations": 1,
@@ -326,3 +328,105 @@ def test_chat_endpoint_new_image_resets_prediction_state(mock_run_agent, mock_up
     assert response.status_code == 200
     assert captured["prediction_id"] is None
     assert captured["predicted_image_s3_key"] is None
+
+
+@patch("app.build_original_image_key", return_value="chat-1/prediction-1/original/image.jpg")
+@patch("app.upload_base64_image", return_value="chat-1/prediction-1/original/image.jpg")
+@patch("app.run_agent")
+def test_chat_endpoint_fresh_upload_sets_original_equal_to_current(mock_run_agent, mock_upload_base64_image, mock_build_original_image_key):
+    """A brand-new image upload has no edits yet, so original_image_s3_key must equal
+    the freshly uploaded current_image_s3_key."""
+    captured = {}
+    mock_run_agent.side_effect = _fake_run_agent_capturing_context(captured)
+
+    payload = {
+        "messages": [
+            {"role": "user", "content": "What's in this image?", "image_base64": "fakebase64text"},
+        ]
+    }
+
+    response = client.post("/chat", json=payload)
+    assert response.status_code == 200
+    assert captured["current_image_s3_key"] == "chat-1/prediction-1/original/image.jpg"
+    assert captured["original_image_s3_key"] == "chat-1/prediction-1/original/image.jpg"
+
+
+@patch("app.run_agent")
+def test_chat_endpoint_original_image_survives_an_edit(mock_run_agent):
+    """After an edit overwrites current_image_s3_key, original_image_s3_key must still
+    point at the pre-edit upload, carried forward from the same assistant message."""
+    captured = {}
+    mock_run_agent.side_effect = _fake_run_agent_capturing_context(captured)
+
+    payload = {
+        "messages": [
+            {"role": "user", "content": "Rotate the image 90 degrees", "image_base64": "fakebase64text"},
+            {
+                "role": "assistant",
+                "content": "Rotated!",
+                "current_image_s3_key": "chat-1/pred-1/edited/rotate_a.png",
+                "original_image_s3_key": "chat-1/pred-1/original/image.jpg",
+            },
+            {"role": "user", "content": "Now blur the person on the left"},
+        ]
+    }
+
+    response = client.post("/chat", json=payload)
+    assert response.status_code == 200
+    assert captured["current_image_s3_key"] == "chat-1/pred-1/edited/rotate_a.png"
+    assert captured["original_image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+
+
+@patch("app.run_agent")
+def test_chat_endpoint_original_image_falls_back_to_current_for_legacy_messages(mock_run_agent):
+    """Assistant messages produced before original_image_s3_key existed won't carry that
+    field - the server should degrade gracefully and fall back to current_image_s3_key
+    rather than losing track of the image entirely."""
+    captured = {}
+    mock_run_agent.side_effect = _fake_run_agent_capturing_context(captured)
+
+    payload = {
+        "messages": [
+            {"role": "user", "content": "Rotate the image 90 degrees", "image_base64": "fakebase64text"},
+            {
+                "role": "assistant",
+                "content": "Rotated!",
+                "current_image_s3_key": "chat-1/pred-1/edited/rotate_a.png",
+                # no original_image_s3_key here - simulates a pre-existing session
+            },
+            {"role": "user", "content": "What's in the image?"},
+        ]
+    }
+
+    response = client.post("/chat", json=payload)
+    assert response.status_code == 200
+    assert captured["current_image_s3_key"] == "chat-1/pred-1/edited/rotate_a.png"
+    assert captured["original_image_s3_key"] == "chat-1/pred-1/edited/rotate_a.png"
+
+
+@patch("app.build_original_image_key", return_value="chat-2/prediction-2/original/image.jpg")
+@patch("app.upload_base64_image", return_value="chat-2/prediction-2/original/image.jpg")
+@patch("app.run_agent")
+def test_chat_endpoint_new_image_resets_original_image(mock_run_agent, mock_upload_base64_image, mock_build_original_image_key):
+    """A brand-new image upload must reset original_image_s3_key to the new upload, not
+    carry forward the previous conversation's original image."""
+    captured = {}
+    mock_run_agent.side_effect = _fake_run_agent_capturing_context(captured)
+
+    payload = {
+        "messages": [
+            {"role": "user", "content": "Rotate the image 90 degrees", "image_base64": "fakebase64text"},
+            {
+                "role": "assistant",
+                "content": "Rotated!",
+                "current_image_s3_key": "chat-1/pred-1/edited/rotate_a.png",
+                "original_image_s3_key": "chat-1/pred-1/original/image.jpg",
+            },
+            {"role": "user", "content": "Here's a new photo", "image_base64": "anotherbase64text"},
+        ]
+    }
+
+    response = client.post("/chat", json=payload)
+    assert response.status_code == 200
+    assert captured["current_image_s3_key"] == "chat-2/prediction-2/original/image.jpg"
+    assert captured["original_image_s3_key"] == "chat-2/prediction-2/original/image.jpg"

@@ -58,15 +58,18 @@ SYSTEM_PROMPT = (
     "You are an AI vision assistant. You help users analyze and edit images via tools. "
     "To analyze an image, you must run `detect_objects`. "
     "If the user asks what is in the image, you must run `detect_objects` first to get a list of detected objects, then you You MUST read the tool output data from `detect_objects` and write a detailed, natural paragraph summary breaking down exactly what items were found. "
+    "(This summary requirement applies ONLY when the user asked what is in the image / to analyze it - it does NOT apply when `detect_objects` was called for a different reason, such as locating an object for an edit request; see IMAGE EDITING below for what to do in that case.) "
     "If the user asks to see the annotated image, you must run `show_annotated_image` to get a public URL of the annotated image with bounding boxes. "
-    "If the user did not ask to see the annotated image, do not run `show_annotated_image`. but you can ask him if he wants to see it if his previous message was what is in the image ?. "
-    "If the user asked what is in the image ? and to show the annotated image in the same message, you must run `detect_objects` first, then after reading the tool output data from `detect_objects`you must run `show_annotated_image` to include the annotated image in your response. "
+    "If the user did not ask to see the annotated image, do not run `show_annotated_image`, but after answering a 'what is in the image' question you MUST ask him, every single time, whether he wants to see the annotated image with bounding boxes - never skip this offer. "
+    "If the user asked what is in the image ? and to show the annotated image in the same message, you must run `detect_objects` first, then after reading the tool output data from `detect_objects`you must run `show_annotated_image`. "
     "If the user said yes after you asked him if he wants to see the annotated image, you must run only `show_annotated_image`. "
     "Never print the raw `box` coordinate arrays (or a coordinates table) in your response to the user - "
+    "Never include an image URL in your response (str) or telling the user you can view the image by clicking on the following link. "
     "use them internally to identify which object is which, but describe objects in plain language instead (e.g. 'the person on the left', 'the car near the top'). "
     "Do not include raw XML tags like `<thinking>` or `</thinking>` in your text reply. "
     "\n"
     "IMAGE EDITING: You also have editing tools: `rotate`, `flip`, `blur`, `resize`, `crop`, `add_noise`. "
+    "You can offer the user to edit the image after showing the annotated image or after showing an edited image. "
     "Each edits the image currently being worked on and returns the result automatically to the user - you do not need a separate 'show' tool after an edit. "
     "Edits can be chained in the same turn (e.g. rotate then blur); each edit builds on the previous edit's result. "
     "To edit the WHOLE image, call the tool without a `bbox` argument. "
@@ -75,6 +78,9 @@ SYSTEM_PROMPT = (
     "Reason over these box coordinates yourself to identify the requested object - e.g. for 'the Nth <label> from the right', filter detections to that label and sort by `box[0]` (the left edge, x1) descending, then pick the Nth one. "
     "For 'from the left' sort ascending; for 'from the top'/'from the bottom' sort by `box[1]` (y1) ascending/descending. "
     "Then call the matching editing tool, passing that detection's `box` as the `bbox` argument. "
+    "IMPORTANT: calling `detect_objects` to locate an object for an edit is NOT the end of your turn - it only gives you coordinates, it never performs an edit by itself. "
+    "You MUST immediately follow it, in this SAME turn, with a call to the matching editing tool (`rotate`/`flip`/`blur`/`resize`/`crop`/`add_noise`) using that detection's `box` as `bbox`. "
+    "Do not stop after `detect_objects` and write a text response describing the edit as already done - an edit is only real once you have actually called the editing tool and it returned a new `output_s3_key` in this turn. "
     "Box coordinates and labels are plain numbers/text, not image pixel data, so it is fine for you to see and reason over them. "
     "Note: `rotate` only accepts angles that are multiples of 90 when `bbox` is given (whole-image rotation allows any angle). "
     "`crop` requires a `bbox` and returns just that cropped region as the final image, not composited back into the full picture. "
@@ -93,6 +99,24 @@ SYSTEM_PROMPT = (
     "you have no real URL or image bytes to put there, so it will only ever render broken. "
     "Every image (annotated_image, edited_image, image_url) is delivered automatically out-of-band and displayed by the frontend "
     "separately from your text - just describe what was done in plain language and let the image appear on its own. "
+    "\n"
+    "ORIGINAL VS CURRENT IMAGE: this conversation may be tracking two different images - the ORIGINAL image "
+    "exactly as the user uploaded it, and the CURRENT image (the result of every edit made so far in this "
+    "conversation, or the same as ORIGINAL if no edits have been made yet). "
+    "If the user asks an analysis question (e.g. 'what is in the image', 'describe it', 'show me the annotated "
+    "image') AND the ORIGINAL and CURRENT image are different (at least one edit has happened in this "
+    "conversation), you must first ask the user in plain text whether they want you to analyze the ORIGINAL "
+    "image or the CURRENT (most recently edited) image, and then STOP - do not call `detect_objects` or "
+    "`show_annotated_image` in that turn. Ask this every single time such a question comes up while ORIGINAL "
+    "and CURRENT differ, even if you already asked earlier in this same conversation - never assume you "
+    "remember or can reuse a previous answer. "
+    "Once the user replies specifying which one they mean, call `detect_objects` with `image_choice=\"original\"` "
+    "or `image_choice=\"current\"` to match their answer. "
+    "If ORIGINAL and CURRENT are the same image (no edits have happened yet), just proceed normally with "
+    "`image_choice=\"current\"` (the default) without asking anything. "
+    "This choice only applies to analysis - the editing tools (`rotate`, `flip`, `blur`, `resize`, `crop`, "
+    "`add_noise`) always operate on the CURRENT image only, never the ORIGINAL, since edits always build on top "
+    "of the latest edited result. Never ask original-vs-current for an editing request. "
 )
 
 class TokenUsage(BaseModel):
@@ -107,6 +131,7 @@ class AgentChatResponse(BaseModel):
     annotated_image: Optional[str] = None
     edited_image: Optional[str] = None
     current_image_s3_key: Optional[str] = None
+    original_image_s3_key: Optional[str] = None
     image_url: Optional[str] = None
     agent_loop_time_s: float
     iterations: int
@@ -118,6 +143,7 @@ class AgentChatResponse(BaseModel):
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
 _current_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_image_s3_key", default=None)
+_current_original_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_original_image_s3_key", default=None)
 _current_prediction_id: ContextVar[Optional[str]] = ContextVar("current_prediction_id", default=None)
 _current_predicted_image_s3_key: ContextVar[Optional[str]] = ContextVar("current_predicted_image_s3_key", default=None)
 
@@ -154,14 +180,19 @@ def download_image_base64(object_key: str) -> Optional[str]:
 
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\([^)]*\)")
 _IMAGE_PLACEHOLDER_RE = re.compile(r"</?image\s*/?>", re.IGNORECASE)
 
 
 def _strip_markdown_images(text: str) -> str:
-    """Remove any markdown image syntax or literal <image> placeholder tokens the model
-    hallucinates (it has no real image bytes or URL to reference, so ![alt](url) or a bare
-    <image> tag always renders as either a broken image or dead text in the frontend)."""
+    """Remove any markdown image/link syntax or literal <image> placeholder tokens the model
+    hallucinates (it has no real image bytes or URL to reference, so ![alt](url), a plain
+    [text](url) link, or a bare <image> tag always renders as either a broken image, a dead/
+    leaked link, or dead text in the frontend). Plain links are collapsed to their link text
+    rather than deleted outright, since that text is usually still a meaningful part of the
+    sentence (e.g. "the following link: Annotated Image")."""
     stripped = _MARKDOWN_IMAGE_RE.sub("", text)
+    stripped = _MARKDOWN_LINK_RE.sub(r"\1", stripped)
     stripped = _IMAGE_PLACEHOLDER_RE.sub("", stripped)
     lines = [line.rstrip() for line in stripped.split("\n")]
     collapsed = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
@@ -183,12 +214,17 @@ def _normalize_response_content(content) -> str:
 
 
 def _extract_tool_data(tool_result) -> dict:
-    """Parse a tool's structured result, whether it came from a local `@tool` (plain JSON
-    string content) or an MCP-discovered tool, which returns `content` as a list of content
-    blocks plus a separate `.artifact["structured_content"]` dict."""
+    """Parse a tool's structured result for internal bookkeeping (S3 keys, prediction ids)
+    that must never be exposed in the LLM-visible `content` (see detect_objects/
+    show_annotated_image, which use response_format="content_and_artifact" specifically so
+    this internal data never sits in the model's context, where it could get echoed back to
+    the user or mistakenly reused as an argument to an editing tool). Handles both a local
+    `@tool`'s flat `.artifact` dict and an MCP-discovered tool's `.artifact["structured_content"]`
+    nesting, falling back to parsing `.content` as JSON for tools with no artifact at all."""
     artifact = getattr(tool_result, "artifact", None)
-    if isinstance(artifact, dict) and isinstance(artifact.get("structured_content"), dict):
-        return artifact["structured_content"]
+    if isinstance(artifact, dict):
+        structured = artifact.get("structured_content")
+        return structured if isinstance(structured, dict) else artifact
     try:
         return json.loads(_normalize_response_content(tool_result.content))
     except (TypeError, json.JSONDecodeError):
@@ -260,34 +296,45 @@ def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
         logging.warning("Failed to fetch annotated image for %s: %s", prediction_id, exc)
         return None
 
-@tool
-def show_annotated_image() -> str:
-    """Retrieves the public URL of the annotated image containing YOLO bounding boxes.
+@tool(response_format="content_and_artifact")
+def show_annotated_image():
+    """Makes the annotated image (with YOLO bounding boxes drawn on it) ready to show the user.
 
     Use this tool ONLY when the user explicitly requests to see the visual image or photo.
     Requires a successful prior execution of detect_objects to provide a valid tracking UID.
+    The image itself is delivered to the user automatically out-of-band - you will not receive
+    a URL or the image bytes here, since you never need to reference them yourself.
     """
     prediction_uid = _current_prediction_id.get()
 
     if not prediction_uid:
         return json.dumps({
             "error": "No object detection has been performed yet in this session. Run detect_objects first."
-        })
+        }), {}
 
     image_url = f"{YOLO_SERVICE_URL}/prediction/{prediction_uid}/image"
-    return json.dumps({"image_url": image_url})
+    return json.dumps({"status": "ready"}), {"image_url": image_url}
 
-@tool
-def detect_objects() -> str:
+@tool(response_format="content_and_artifact")
+def detect_objects(image_choice: str = "current"):
     """Detect and identify objects in the image provided by the user using YOLO object detection.
+
+    Args:
+        image_choice: Which image to analyze - "current" (default) for the most recently edited
+            image (or the original if no edits have been made yet), or "original" for the image
+            exactly as the user first uploaded it, before any edits. Only pass "original" when the
+            user has explicitly told you they want the original image analyzed.
 
     Returns a `detections` list with each object's `label`, `score`, and `box` ([x1, y1, x2, y2] pixel
     coordinates), which you can reason over to target a specific object (e.g. "the second dog from the right")
     for the image-editing tools.
     """
-    image_s3_key = _current_image_s3_key.get()
+    if image_choice == "original":
+        image_s3_key = _current_original_image_s3_key.get() or _current_image_s3_key.get()
+    else:
+        image_s3_key = _current_image_s3_key.get()
     if not image_s3_key:
-        return json.dumps({"error": "No image was provided by the user."})
+        return json.dumps({"error": "No image was provided by the user."}), {}
 
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -309,7 +356,13 @@ def detect_objects() -> str:
                     }
                     for obj in detection_objects
                 ]
-        return json.dumps(result)
+        # The full `result` (which includes internal bookkeeping like predicted_image_s3_key)
+        # is kept ONLY in the artifact for run_agent's own use - the LLM must never see a raw
+        # S3 key for the annotated image, or it can end up passing that key into an editing
+        # tool instead of the actual current image (it has no legitimate reason to reference
+        # any S3 key from this tool's result at all).
+        content = {"detections": result.get("detections", [])}
+        return json.dumps(content), result
     except httpx.HTTPStatusError as exc:
         detail = None
         try:
@@ -320,12 +373,12 @@ def detect_objects() -> str:
             "error": "YOLO service request failed.",
             "status_code": exc.response.status_code,
             "detail": detail,
-        })
+        }), {}
     except httpx.RequestError as exc:
         return json.dumps({
             "error": "YOLO service is unavailable.",
             "detail": str(exc),
-        })
+        }), {}
 
 
 # Initialize a rate limiter (30 Requests per minute baseline, max burst capacity of 2 requests)
@@ -401,7 +454,17 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
       3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
     current_key = _current_image_s3_key.get()
-    if current_key:
+    original_key = _current_original_image_s3_key.get()
+    if current_key and original_key and original_key != current_key:
+        image_context = (
+            f"\nORIGINAL IMAGE: image_s3_key = \"{original_key}\" (exactly as the user uploaded it, before any edits).\n"
+            f"CURRENT IMAGE: image_s3_key = \"{current_key}\" (the result of edits made so far in this conversation).\n"
+            "These are DIFFERENT images because at least one edit has been made. Every image-editing tool call "
+            "(rotate, flip, blur, resize, crop, add_noise) must use the CURRENT image's `image_s3_key`, never the "
+            "ORIGINAL's. Each edit returns a new `output_s3_key` - if you chain multiple edits in the same turn "
+            "(e.g. rotate then blur), pass the previous edit's `output_s3_key` as the next call's `image_s3_key`."
+        )
+    elif current_key:
         image_context = (
             f"\nCURRENT IMAGE: image_s3_key = \"{current_key}\". Every image-editing tool call "
             "(rotate, flip, blur, resize, crop, add_noise) requires this exact `image_s3_key` argument. "
@@ -457,6 +520,7 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
                 "annotated_image": annotated_image,
                 "edited_image": edited_image,
                 "current_image_s3_key": _current_image_s3_key.get(),
+                "original_image_s3_key": _current_original_image_s3_key.get(),
                 "image_url": image_url,
                 "agent_loop_time_s": loop_time,
                 "iterations": iterations,
@@ -473,6 +537,18 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
         for tool_call in response.tool_calls:
             tool_name = tool_call.get("name")
             tool_fn = TOOLS[tool_name]
+
+            if tool_name in IMAGE_EDIT_TOOL_NAMES:
+                # Never trust whatever image_s3_key the model supplied for an edit - always
+                # force it to the actual tracked current image. The model's context can
+                # contain multiple S3 keys (e.g. a detection's annotated-image key), and it
+                # has occasionally picked the wrong one; forcing this server-side makes "first
+                # edit uses the original, later edits build on the previous edit" correct by
+                # construction instead of depending on the model getting it right.
+                tracked_current_key = _current_image_s3_key.get()
+                if tracked_current_key:
+                    tool_call = {**tool_call, "args": {**tool_call.get("args", {}), "image_s3_key": tracked_current_key}}
+
             tool_result = await tool_fn.ainvoke(tool_call)
 
             tool_output = tool_result.content if hasattr(tool_result, "content") else str(tool_result)
@@ -528,6 +604,7 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
         "annotated_image": annotated_image,
         "edited_image": edited_image,
         "current_image_s3_key": _current_image_s3_key.get(),
+        "original_image_s3_key": _current_original_image_s3_key.get(),
         "image_url": image_url,
         "agent_loop_time_s": loop_time,
         "iterations": iterations,
@@ -559,6 +636,7 @@ class ChatMessage(BaseModel):
     content: str
     image_base64: Optional[str] = None  # only on user messages that carry an image
     current_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
+    original_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
     prediction_id: Optional[str] = None  # echoed back on assistant messages to carry state across turns
     predicted_image_s3_key: Optional[str] = None  # echoed back on assistant messages to carry state across turns
     tool_trace: Optional[str] = None  # echoed back on assistant messages to restore the real tool-call/result history
@@ -597,6 +675,7 @@ async def chat(request: ChatRequest):
     )
 
     image_s3_key = None
+    original_image_s3_key = None
     prediction_id = None
     predicted_image_s3_key = None
     if new_image_uploaded_this_turn:
@@ -606,25 +685,31 @@ async def chat(request: ChatRequest):
             image_s3_key = upload_base64_image(latest_image, s3_key)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Failed to upload image to S3: {exc}") from exc
-        # A new image has nothing to do with any prior detection - prediction_id/
-        # predicted_image_s3_key stay None so a fresh detect_objects call is required.
+        # A fresh upload is both the original and the current image, and has nothing
+        # to do with any prior detection - prediction_id/predicted_image_s3_key stay
+        # None so a fresh detect_objects call is required.
+        original_image_s3_key = image_s3_key
     else:
         # No new upload this turn - carry forward the most recent image-state
-        # snapshot from history (current_image_s3_key/prediction_id/predicted_image_s3_key
-        # were all echoed together on the same assistant message). Take all three from
-        # the SAME message rather than independently merging fields from different
-        # messages - an edit clears prediction_id/predicted_image_s3_key on its message,
-        # and independently falling back to an older message's prediction_id there would
-        # resurrect a prediction computed against a since-replaced image.
+        # snapshot from history (current_image_s3_key/original_image_s3_key/prediction_id/
+        # predicted_image_s3_key were all echoed together on the same assistant message).
+        # Take all of them from the SAME message rather than independently merging fields
+        # from different messages - an edit clears prediction_id/predicted_image_s3_key on
+        # its message, and independently falling back to an older message's prediction_id
+        # there would resurrect a prediction computed against a since-replaced image.
         for msg in reversed(request.messages):
             if msg.current_image_s3_key:
                 image_s3_key = msg.current_image_s3_key
+                # Fall back to current_image_s3_key for messages produced before the
+                # original_image_s3_key field existed, so old sessions degrade gracefully.
+                original_image_s3_key = msg.original_image_s3_key or msg.current_image_s3_key
                 prediction_id = msg.prediction_id
                 predicted_image_s3_key = msg.predicted_image_s3_key
                 break
 
     token_img = _current_image_b64.set(latest_image)
     token_img_s3 = _current_image_s3_key.set(image_s3_key)
+    token_original_img_s3 = _current_original_image_s3_key.set(original_image_s3_key)
     token_pred = _current_prediction_id.set(prediction_id)
     token_predicted_key = _current_predicted_image_s3_key.set(predicted_image_s3_key)
     try:
@@ -633,6 +718,7 @@ async def chat(request: ChatRequest):
     finally:
         _current_image_b64.reset(token_img)
         _current_image_s3_key.reset(token_img_s3)
+        _current_original_image_s3_key.reset(token_original_img_s3)
         _current_prediction_id.reset(token_pred)
         _current_predicted_image_s3_key.reset(token_predicted_key)
 

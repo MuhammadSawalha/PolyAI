@@ -165,9 +165,11 @@ def test_strip_markdown_images_removes_multiple_images():
     assert "Before" in result and "middle" in result and "after" in result
 
 
-def test_strip_markdown_images_leaves_normal_text_and_links_alone():
+def test_strip_markdown_images_collapses_plain_links_to_their_text():
+    """The agent must never emit a real clickable link (the system prompt forbids it), so a
+    plain markdown link is collapsed to just its link text rather than left as a live link."""
     text = "The image has been rotated. [See details](http://example.com/prediction/1)"
-    assert app._strip_markdown_images(text) == text
+    assert app._strip_markdown_images(text) == "The image has been rotated. See details"
 
 
 def test_strip_markdown_images_noop_on_plain_text():
@@ -274,11 +276,16 @@ def test_fetch_annotated_image_exceptions():
 
 
 def test_show_annotated_image_tool_full_execution():
-    """Verify successful runtime execution of show_annotated_image tool."""
+    """Verify successful runtime execution of show_annotated_image tool - image_url must only
+    live in the artifact (internal bookkeeping), never in the LLM-visible content, so the
+    model has no real URL in its context to leak back to the user."""
     app._current_prediction_id.set("prediction-123")
-    res = json.loads(app.show_annotated_image.invoke({}))
-    assert "image_url" in res
-    assert "prediction-123" in res["image_url"]
+    tool_call = {"name": "show_annotated_image", "args": {}, "id": "call_1", "type": "tool_call"}
+    tool_message = app.show_annotated_image.invoke(tool_call)
+    content = json.loads(tool_message.content)
+    assert "image_url" not in content
+    assert content == {"status": "ready"}
+    assert "prediction-123" in tool_message.artifact["image_url"]
 
 
 def test_show_annotated_image_tool_ordering():
@@ -311,9 +318,15 @@ def test_detect_objects_tool_success(mock_client_class):
     mock_client_instance.get.return_value = mock_detail_response
     mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
-    res = json.loads(app.detect_objects.invoke({}))
-    assert res["prediction_uid"] == "pred-abc"
-    assert res["detections"] == [{"id": 1, "label": "dog", "score": 0.9, "box": [10.0, 20.0, 30.0, 40.0]}]
+    tool_call = {"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}
+    tool_message = app.detect_objects.invoke(tool_call)
+    content = json.loads(tool_message.content)
+    # prediction_uid/predicted_image_s3_key are internal bookkeeping and must NEVER be
+    # exposed in the LLM-visible content - only the artifact carries them, for run_agent's
+    # own use, so the model can't mistake an annotated-image S3 key for the current image.
+    assert "prediction_uid" not in content
+    assert content["detections"] == [{"id": 1, "label": "dog", "score": 0.9, "box": [10.0, 20.0, 30.0, 40.0]}]
+    assert tool_message.artifact["prediction_uid"] == "pred-abc"
     mock_client_instance.post.assert_called_once_with(
         f"{app.YOLO_SERVICE_URL}/predict",
         json={"image_s3_key": "chat-1/prediction-1/original/image.jpg"},
@@ -334,8 +347,8 @@ def test_detect_objects_tool_success_without_prediction_uid(mock_client_class):
     mock_client_instance.post.return_value = mock_predict_response
     mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
-    res = json.loads(app.detect_objects.invoke({}))
-    assert "detections" not in res
+    content = json.loads(app.detect_objects.invoke({}))
+    assert content["detections"] == []
     mock_client_instance.get.assert_not_called()
 
 
@@ -401,6 +414,85 @@ def test_detect_objects_missing_image_context():
     app._current_image_s3_key.set(None)
     error_response = json.loads(app.detect_objects.invoke({}))
     assert "error" in error_response
+
+
+@patch("httpx.Client")
+def test_detect_objects_default_image_choice_uses_current(mock_client_class):
+    """With no image_choice argument, detect_objects must analyze the CURRENT image, not
+    the original - preserving existing behavior for all pre-existing callers."""
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_detail_response = MagicMock()
+    mock_detail_response.json.return_value = {"detection_objects": []}
+    mock_detail_response.raise_for_status = MagicMock()
+    mock_client_instance.get.return_value = mock_detail_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    json.loads(app.detect_objects.invoke({}))
+    mock_client_instance.post.assert_called_once_with(
+        f"{app.YOLO_SERVICE_URL}/predict",
+        json={"image_s3_key": "chat-1/pred-1/edited/blur_b.png"},
+    )
+
+    app._current_original_image_s3_key.set(None)
+
+
+@patch("httpx.Client")
+def test_detect_objects_image_choice_original_uses_original_key(mock_client_class):
+    """With image_choice="original", detect_objects must analyze the ORIGINAL image the
+    user uploaded, not whatever edits have happened since."""
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_detail_response = MagicMock()
+    mock_detail_response.json.return_value = {"detection_objects": []}
+    mock_detail_response.raise_for_status = MagicMock()
+    mock_client_instance.get.return_value = mock_detail_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    json.loads(app.detect_objects.invoke({"image_choice": "original"}))
+    mock_client_instance.post.assert_called_once_with(
+        f"{app.YOLO_SERVICE_URL}/predict",
+        json={"image_s3_key": "chat-1/pred-1/original/image.jpg"},
+    )
+
+    app._current_original_image_s3_key.set(None)
+
+
+@patch("httpx.Client")
+def test_detect_objects_image_choice_original_falls_back_to_current(mock_client_class):
+    """If no original image key is tracked (e.g. no edits have happened yet), image_choice="original"
+    must fall back to the current image rather than erroring."""
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_original_image_s3_key.set(None)
+
+    mock_client_instance = MagicMock()
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_detail_response = MagicMock()
+    mock_detail_response.json.return_value = {"detection_objects": []}
+    mock_detail_response.raise_for_status = MagicMock()
+    mock_client_instance.get.return_value = mock_detail_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    json.loads(app.detect_objects.invoke({"image_choice": "original"}))
+    mock_client_instance.post.assert_called_once_with(
+        f"{app.YOLO_SERVICE_URL}/predict",
+        json={"image_s3_key": "chat-1/pred-1/original/image.jpg"},
+    )
 
 
 def test_invalid_framework_model_constraints():
@@ -474,6 +566,67 @@ def test_run_agent_chains_image_edits(monkeypatch):
     assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_b.png"
     assert result["current_image_s3_key"] == "chat-1/pred-1/edited/blur_b.png"
     assert app._current_image_s3_key.get() == "chat-1/pred-1/edited/blur_b.png"
+
+
+class FakeRecordingImageEditTool:
+    """Like FakeImageEditTool, but records every tool_call it actually received so a test
+    can assert on the args run_agent ended up passing in."""
+
+    def __init__(self, output_s3_key):
+        self.output_s3_key = output_s3_key
+        self.received_tool_calls = []
+
+    async def ainvoke(self, tool_call):
+        self.received_tool_calls.append(tool_call)
+        return type("FakeMessage", (), {"content": json.dumps({"output_s3_key": self.output_s3_key, "width": 10, "height": 10})})()
+
+
+class FakeBlurWithWrongKeyLLM:
+    """Simulates a model that (incorrectly) supplies the annotated image's S3 key instead of
+    the actual current image for an edit tool call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blur",
+                    "args": {"radius": 2.0, "image_s3_key": "chat-1/pred-1/predicted/annotated_with_boxes.jpg"},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Blurred the image.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+def test_run_agent_overrides_wrong_image_s3_key_on_edit_tool_calls(monkeypatch):
+    """Regression test: even if the model supplies the wrong image_s3_key (e.g. the annotated
+    image's key instead of the current clean image), run_agent must force the edit tool call
+    to use the actual tracked current image - never trust the model's argument for this. This
+    is what makes "first edit uses the original, later edits build on the previous edit"
+    correct by construction instead of depending on the model picking the right key."""
+    fake_llm = FakeBlurWithWrongKeyLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    fake_blur_tool = FakeRecordingImageEditTool("chat-1/pred-1/edited/blur_a.png")
+    monkeypatch.setattr(app, "TOOLS", {"blur": fake_blur_tool})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"blur"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    result = run_async(app.run_agent([HumanMessage(content="blur the first person from the left")]))
+
+    assert len(fake_blur_tool.received_tool_calls) == 1
+    assert fake_blur_tool.received_tool_calls[0]["args"]["image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+    # The model-supplied edit args (radius, bbox, etc.) must still pass through untouched.
+    assert fake_blur_tool.received_tool_calls[0]["args"]["radius"] == 2.0
+    assert result["current_image_s3_key"] == "chat-1/pred-1/edited/blur_a.png"
 
 
 def test_run_agent_edit_invalidates_stale_annotation(monkeypatch):

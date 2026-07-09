@@ -5,6 +5,7 @@ export interface ChatMessage {
   annotated_image?: string | null;
   edited_image?: string | null;
   current_image_s3_key?: string | null;
+  original_image_s3_key?: string | null;
   prediction_id?: string | null;
   predicted_image_s3_key?: string | null;
   image_url?: string;

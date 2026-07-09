@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   frontend:
-    image: muhammadsawalha/frontend-service:${FRONTEND_IMAGE_TAG:-0.0.1}
+    image: muhammadsawalha/frontend-service:${FRONTEND_IMAGE_TAG:-0.0.2}
     container_name: frontend
     ports:
       - "3000:3000"
@@ -12,7 +12,7 @@ services:
       - polyai-net
 
   agent:
-    image: muhammadsawalha/agent-service:${AGENT_IMAGE_TAG:-0.0.1}
+    image: muhammadsawalha/agent-service:${AGENT_IMAGE_TAG:-0.0.2}
     container_name: agent
     ports:
       - "8000:8000"
@@ -22,6 +22,7 @@ services:
       - MODEL_PROVIDER=bedrock_converse
       - MODEL=amazon.nova-lite-v1:0
       - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=sawalha-polyai-images
     volumes:
       - ~/.aws:/root/.aws:ro
     depends_on:
@@ -31,20 +32,26 @@ services:
       - polyai-net
 
   yolo:
-    image: muhammadsawalha/yolo-service:${YOLO_IMAGE_TAG:-0.0.1}
+    image: muhammadsawalha/yolo-service:${YOLO_IMAGE_TAG:-0.0.2}
     container_name: yolo
     ports:
       - "8080:8080"
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=sawalha-polyai-images
+    volumes:
+      - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
 
   img-proc-mcp:
-    image: muhammadsawalha/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG:-0.0.1}
+    image: muhammadsawalha/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG:-0.0.2}
     container_name: img-proc-mcp
     ports:
       - "9000:9000"
     environment:
       - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=sawalha-polyai-images
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:

@@ -7,6 +7,7 @@ export interface SendMessageResult {
   annotated_image: string | null;
   edited_image: string | null;
   current_image_s3_key: string | null;
+  original_image_s3_key: string | null;
   prediction_id: string | null;
   predicted_image_s3_key: string | null;
   image_url: string | null;
@@ -31,6 +32,7 @@ export async function sendMessage(
     annotated_image: data.annotated_image ?? null,
     edited_image: data.edited_image ?? null,
     current_image_s3_key: data.current_image_s3_key ?? null,
+    original_image_s3_key: data.original_image_s3_key ?? null,
     prediction_id: data.prediction_id ?? null,
     predicted_image_s3_key: data.predicted_image_s3_key ?? null,
     image_url: data.image_url ?? null,
