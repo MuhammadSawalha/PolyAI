@@ -416,83 +416,37 @@ def test_detect_objects_missing_image_context():
     assert "error" in error_response
 
 
-@patch("httpx.Client")
-def test_detect_objects_default_image_choice_uses_current(mock_client_class):
-    """With no image_choice argument, detect_objects must analyze the CURRENT image, not
-    the original - preserving existing behavior for all pre-existing callers."""
+def test_reset_image_tool_success():
+    """reset_image should report status "reset" when the current image differs from the
+    original - i.e. there's actually something to discard."""
     app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
     app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
 
-    mock_client_instance = MagicMock()
-    mock_predict_response = MagicMock()
-    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
-    mock_predict_response.raise_for_status = MagicMock()
-    mock_client_instance.post.return_value = mock_predict_response
-    mock_detail_response = MagicMock()
-    mock_detail_response.json.return_value = {"detection_objects": []}
-    mock_detail_response.raise_for_status = MagicMock()
-    mock_client_instance.get.return_value = mock_detail_response
-    mock_client_class.return_value.__enter__.return_value = mock_client_instance
-
-    json.loads(app.detect_objects.invoke({}))
-    mock_client_instance.post.assert_called_once_with(
-        f"{app.YOLO_SERVICE_URL}/predict",
-        json={"image_s3_key": "chat-1/pred-1/edited/blur_b.png"},
-    )
+    res = json.loads(app.reset_image.invoke({}))
+    assert res == {"status": "reset"}
 
     app._current_original_image_s3_key.set(None)
 
 
-@patch("httpx.Client")
-def test_detect_objects_image_choice_original_uses_original_key(mock_client_class):
-    """With image_choice="original", detect_objects must analyze the ORIGINAL image the
-    user uploaded, not whatever edits have happened since."""
-    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
-    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
-
-    mock_client_instance = MagicMock()
-    mock_predict_response = MagicMock()
-    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
-    mock_predict_response.raise_for_status = MagicMock()
-    mock_client_instance.post.return_value = mock_predict_response
-    mock_detail_response = MagicMock()
-    mock_detail_response.json.return_value = {"detection_objects": []}
-    mock_detail_response.raise_for_status = MagicMock()
-    mock_client_instance.get.return_value = mock_detail_response
-    mock_client_class.return_value.__enter__.return_value = mock_client_instance
-
-    json.loads(app.detect_objects.invoke({"image_choice": "original"}))
-    mock_client_instance.post.assert_called_once_with(
-        f"{app.YOLO_SERVICE_URL}/predict",
-        json={"image_s3_key": "chat-1/pred-1/original/image.jpg"},
-    )
-
-    app._current_original_image_s3_key.set(None)
-
-
-@patch("httpx.Client")
-def test_detect_objects_image_choice_original_falls_back_to_current(mock_client_class):
-    """If no original image key is tracked (e.g. no edits have happened yet), image_choice="original"
-    must fall back to the current image rather than erroring."""
+def test_reset_image_tool_already_original():
+    """reset_image should report status "already_original" as a no-op when no edits have
+    happened yet, rather than claiming a reset occurred."""
     app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    res = json.loads(app.reset_image.invoke({}))
+    assert res == {"status": "already_original"}
+
     app._current_original_image_s3_key.set(None)
 
-    mock_client_instance = MagicMock()
-    mock_predict_response = MagicMock()
-    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
-    mock_predict_response.raise_for_status = MagicMock()
-    mock_client_instance.post.return_value = mock_predict_response
-    mock_detail_response = MagicMock()
-    mock_detail_response.json.return_value = {"detection_objects": []}
-    mock_detail_response.raise_for_status = MagicMock()
-    mock_client_instance.get.return_value = mock_detail_response
-    mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
-    json.loads(app.detect_objects.invoke({"image_choice": "original"}))
-    mock_client_instance.post.assert_called_once_with(
-        f"{app.YOLO_SERVICE_URL}/predict",
-        json={"image_s3_key": "chat-1/pred-1/original/image.jpg"},
-    )
+def test_reset_image_tool_no_original_tracked():
+    """reset_image should return an error if no original image is tracked at all."""
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set(None)
+
+    res = json.loads(app.reset_image.invoke({}))
+    assert "error" in res
 
 
 def test_invalid_framework_model_constraints():
@@ -651,6 +605,81 @@ def test_run_agent_edit_invalidates_stale_annotation(monkeypatch):
     assert result["predicted_image_s3_key"] is None
     assert app._current_prediction_id.get() is None
     assert app._current_predicted_image_s3_key.get() is None
+
+
+class FakeResetLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "reset_image", "args": {}, "id": "call_1", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Reset the image back to the original.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+class FakeResetTool:
+    """Mirrors app.reset_image's status logic without going through BaseTool.ainvoke's
+    executor-based sync-to-async bridging, which needs a real running event loop that
+    run_async (used by these tests) does not provide."""
+
+    async def ainvoke(self, tool_call):
+        original_key = app._current_original_image_s3_key.get()
+        content = json.dumps({"status": "reset"} if original_key else {"error": "No original image is available to reset to."})
+        return type("FakeMessage", (), {"content": content})()
+
+
+def test_run_agent_reset_image_restores_original(monkeypatch):
+    """A reset_image tool call must restore _current_image_s3_key to the original, populate
+    edited_image with the restored original's bytes, and invalidate stale prediction state -
+    mirroring how a normal edit is bookkept."""
+    fake_llm = FakeResetLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {"reset_image": FakeResetTool()})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_prediction_id.set("stale-prediction")
+    app._current_predicted_image_s3_key.set("chat-1/pred-1/predicted/stale.jpg")
+
+    result = run_async(app.run_agent([HumanMessage(content="reset the image")]))
+
+    assert result["response"] == "Reset the image back to the original."
+    assert result["current_image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/original/image.jpg"
+    assert app._current_image_s3_key.get() == "chat-1/pred-1/original/image.jpg"
+    assert result["prediction_id"] is None
+    assert result["predicted_image_s3_key"] is None
+    assert app._current_prediction_id.get() is None
+    assert app._current_predicted_image_s3_key.get() is None
+
+    app._current_original_image_s3_key.set(None)
+
+
+def test_run_agent_reset_image_noop_when_already_original(monkeypatch):
+    """If current already equals original, a reset_image call must not spuriously mark
+    anything as newly edited."""
+    fake_llm = FakeResetLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {"reset_image": FakeResetTool()})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    result = run_async(app.run_agent([HumanMessage(content="reset the image")]))
+
+    assert result["edited_image"] is None
+    assert result["current_image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+
+    app._current_original_image_s3_key.set(None)
 
 
 def test_run_agent_stops_at_max_iterations_populates_edited_image(monkeypatch):

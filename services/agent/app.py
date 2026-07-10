@@ -40,6 +40,7 @@ MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "bedrock_converse")
 
 ALLOWED_MODELS = {
     "anthropic.claude-3-haiku-20240307-v1:0",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     "amazon.nova-micro-v1:0",
     "amazon.nova-lite-v1:0",
     "openai.gpt-oss-20b-1:0",
@@ -69,7 +70,6 @@ SYSTEM_PROMPT = (
     "Do not include raw XML tags like `<thinking>` or `</thinking>` in your text reply. "
     "\n"
     "IMAGE EDITING: You also have editing tools: `rotate`, `flip`, `blur`, `resize`, `crop`, `add_noise`. "
-    "You can offer the user to edit the image after showing the annotated image or after showing an edited image. "
     "Each edits the image currently being worked on and returns the result automatically to the user - you do not need a separate 'show' tool after an edit. "
     "Edits can be chained in the same turn (e.g. rotate then blur); each edit builds on the previous edit's result. "
     "To edit the WHOLE image, call the tool without a `bbox` argument. "
@@ -100,23 +100,16 @@ SYSTEM_PROMPT = (
     "Every image (annotated_image, edited_image, image_url) is delivered automatically out-of-band and displayed by the frontend "
     "separately from your text - just describe what was done in plain language and let the image appear on its own. "
     "\n"
-    "ORIGINAL VS CURRENT IMAGE: this conversation may be tracking two different images - the ORIGINAL image "
-    "exactly as the user uploaded it, and the CURRENT image (the result of every edit made so far in this "
-    "conversation, or the same as ORIGINAL if no edits have been made yet). "
-    "If the user asks an analysis question (e.g. 'what is in the image', 'describe it', 'show me the annotated "
-    "image') AND the ORIGINAL and CURRENT image are different (at least one edit has happened in this "
-    "conversation), you must first ask the user in plain text whether they want you to analyze the ORIGINAL "
-    "image or the CURRENT (most recently edited) image, and then STOP - do not call `detect_objects` or "
-    "`show_annotated_image` in that turn. Ask this every single time such a question comes up while ORIGINAL "
-    "and CURRENT differ, even if you already asked earlier in this same conversation - never assume you "
-    "remember or can reuse a previous answer. "
-    "Once the user replies specifying which one they mean, call `detect_objects` with `image_choice=\"original\"` "
-    "or `image_choice=\"current\"` to match their answer. "
-    "If ORIGINAL and CURRENT are the same image (no edits have happened yet), just proceed normally with "
-    "`image_choice=\"current\"` (the default) without asking anything. "
-    "This choice only applies to analysis - the editing tools (`rotate`, `flip`, `blur`, `resize`, `crop`, "
-    "`add_noise`) always operate on the CURRENT image only, never the ORIGINAL, since edits always build on top "
-    "of the latest edited result. Never ask original-vs-current for an editing request. "
+    "RESETTING: this conversation keeps track of the ORIGINAL image exactly as the user uploaded it, purely so "
+    "it can be restored later - you never need or see its S3 key directly. If the user asks to reset the image, "
+    "undo all edits, start over, or go back to the original, call `reset_image` (it takes no arguments) - this "
+    "discards every edit made so far in this conversation and makes the original upload the current image again. "
+    "\n"
+    "After you perform image edit ONLY (`rotate`, `flip`, `blur`, `resize`, `crop`, `add_noise`), you MUST ask the user, every single time, whether they'd like to edit something else or "
+    "reset all changes back to the original image - never skip this offer, even if you already asked earlier "
+    "in this conversation. "
+    "After you perform reset via `reset_image`, you MUST ask the user, every single time, whether they'd like to edit something else - never skip this offer, even if you already asked earlier in this conversation. "
+    "After showing the annotated image, you MUST ask the user, every single time, whether they'd like to edit something else but dont ask to reset all changes - never skip this offer, even if you already asked earlier in this conversation. "
 )
 
 class TokenUsage(BaseModel):
@@ -296,6 +289,21 @@ def _fetch_annotated_image(prediction_id: Optional[str]) -> Optional[str]:
         logging.warning("Failed to fetch annotated image for %s: %s", prediction_id, exc)
         return None
 
+@tool
+def reset_image() -> str:
+    """Resets the image back to the original upload, discarding every edit made so far in this
+    conversation. Use this when the user asks to reset the image, undo all edits, start over, or
+    go back to the original image. Takes no arguments.
+    """
+    original_key = _current_original_image_s3_key.get()
+    current_key = _current_image_s3_key.get()
+
+    if not original_key:
+        return json.dumps({"error": "No original image is available to reset to."})
+    if current_key == original_key:
+        return json.dumps({"status": "already_original"})
+    return json.dumps({"status": "reset"})
+
 @tool(response_format="content_and_artifact")
 def show_annotated_image():
     """Makes the annotated image (with YOLO bounding boxes drawn on it) ready to show the user.
@@ -316,23 +324,14 @@ def show_annotated_image():
     return json.dumps({"status": "ready"}), {"image_url": image_url}
 
 @tool(response_format="content_and_artifact")
-def detect_objects(image_choice: str = "current"):
-    """Detect and identify objects in the image provided by the user using YOLO object detection.
-
-    Args:
-        image_choice: Which image to analyze - "current" (default) for the most recently edited
-            image (or the original if no edits have been made yet), or "original" for the image
-            exactly as the user first uploaded it, before any edits. Only pass "original" when the
-            user has explicitly told you they want the original image analyzed.
+def detect_objects():
+    """Detect and identify objects in the current image using YOLO object detection.
 
     Returns a `detections` list with each object's `label`, `score`, and `box` ([x1, y1, x2, y2] pixel
     coordinates), which you can reason over to target a specific object (e.g. "the second dog from the right")
     for the image-editing tools.
     """
-    if image_choice == "original":
-        image_s3_key = _current_original_image_s3_key.get() or _current_image_s3_key.get()
-    else:
-        image_s3_key = _current_image_s3_key.get()
+    image_s3_key = _current_image_s3_key.get()
     if not image_s3_key:
         return json.dumps({"error": "No image was provided by the user."}), {}
 
@@ -416,6 +415,7 @@ IMAGE_EDIT_TOOL_NAMES = {t.name for t in img_edit_tools}
 TOOLS = {
     detect_objects.name: detect_objects,
     show_annotated_image.name: show_annotated_image,
+    reset_image.name: reset_image,
     **{t.name: t for t in img_edit_tools},
 }
 
@@ -454,17 +454,7 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
       3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
     current_key = _current_image_s3_key.get()
-    original_key = _current_original_image_s3_key.get()
-    if current_key and original_key and original_key != current_key:
-        image_context = (
-            f"\nORIGINAL IMAGE: image_s3_key = \"{original_key}\" (exactly as the user uploaded it, before any edits).\n"
-            f"CURRENT IMAGE: image_s3_key = \"{current_key}\" (the result of edits made so far in this conversation).\n"
-            "These are DIFFERENT images because at least one edit has been made. Every image-editing tool call "
-            "(rotate, flip, blur, resize, crop, add_noise) must use the CURRENT image's `image_s3_key`, never the "
-            "ORIGINAL's. Each edit returns a new `output_s3_key` - if you chain multiple edits in the same turn "
-            "(e.g. rotate then blur), pass the previous edit's `output_s3_key` as the next call's `image_s3_key`."
-        )
-    elif current_key:
+    if current_key:
         image_context = (
             f"\nCURRENT IMAGE: image_s3_key = \"{current_key}\". Every image-editing tool call "
             "(rotate, flip, blur, resize, crop, add_noise) requires this exact `image_s3_key` argument. "
@@ -587,6 +577,18 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
                     # Any previously computed YOLO annotation is now stale (boxes
                     # would be misaligned against the edited image) - force a fresh
                     # detect_objects call if annotations are requested again.
+                    prediction_id = None
+                    predicted_image_s3_key = None
+                    _current_prediction_id.set(None)
+                    _current_predicted_image_s3_key.set(None)
+
+            if tool_name == "reset_image":
+                original_key = _current_original_image_s3_key.get()
+                if original_key and original_key != _current_image_s3_key.get():
+                    _current_image_s3_key.set(original_key)
+                    last_edited_image_s3_key = original_key
+                    # Same as an edit: any annotation computed against the discarded
+                    # edits is stale against the restored original image.
                     prediction_id = None
                     predicted_image_s3_key = None
                     _current_prediction_id.set(None)
