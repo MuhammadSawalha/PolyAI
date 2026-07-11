@@ -18,8 +18,8 @@ services:
       - "8000:8000"
     env_file:
       - services/agent/.env
-    volumes:
-      - ~/.aws:/root/.aws:ro
+    #volumes:
+    #  - ~/.aws:/root/.aws:ro
     depends_on:
       - yolo
       - img-proc-mcp
@@ -33,8 +33,8 @@ services:
       - "8080:8080"
     env_file:
       - services/yolo/.env
-    volumes:
-      - ~/.aws:/root/.aws:ro
+    #volumes:
+    #  - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
 
@@ -45,8 +45,8 @@ services:
       - "9000:9000"
     env_file:
       - services/img-proc-mcp/.env
-    volumes:
-      - ~/.aws:/root/.aws:ro
+    #volumes:
+    #  - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
 

@@ -8,6 +8,9 @@ RUN npm install && npm cache clean --force
 
 COPY . .
 
+ARG NEXT_PUBLIC_AGENT_URL
+ENV NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL}
+
 RUN npm run build
 
 EXPOSE 3000
