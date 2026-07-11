@@ -30,6 +30,9 @@ jobs:
           context: services/frontend
           file: services/frontend/Dockerfile
           push: true
+          build-args: |
+            NEXT_PUBLIC_AGENT_URL=${{ github.ref_name == 'dev' &&
+             'http://sawalha.dev.fursa.click:8000' || 'http://sawalha.prod.fursa.click:8000' }}
           tags: muhammadsawalha/frontend-service:${{ steps.tag.outputs.tag }}
           cache-from: type=gha,scope=frontend-deploy
           cache-to: type=gha,mode=max,scope=frontend-deploy
