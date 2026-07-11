@@ -1,0 +1,27 @@
+name: Deploy Monitoring Stack
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'monitoring/**'
+      - 'docker-compose.yaml'
+      - '.github/workflows/deploy-monitoring.yaml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy monitoring stack
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_IP || secrets.DEV_INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_SSH_KEY || secrets.DEV_INSTANCE_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/PolyAI
+            git fetch origin
+            git reset --hard origin/${{ github.ref_name }}
+            docker compose pull prometheus grafana node-exporter
+            docker compose up -d prometheus grafana node-exporter

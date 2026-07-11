@@ -1,0 +1,51 @@
+{
+  "evals": [
+    {
+      "name": "add-new-image-editing-tool-sharpen",
+      "prompt": "Use the img-proc-mcp skill to add a new `sharpen` tool to the img-proc-mcp server, taking an optional `factor` parameter, and wire it into the agent so the LLM can call it (including for a specific detected object).",
+      "expected_output": "New `sharpen` MCP tool in services/img-proc-mcp/app.py following the (image_s3_key, factor, bbox=None) -> dict signature, using the existing _download_image/_apply_in_place/_finish helper pipeline. New tests covering whole-image and bbox-scoped paths. New `sharpen` @tool wrapper in services/agent/app.py added to TOOLS and IMAGE_EDIT_TOOL_NAMES, tested via the IMAGE_EDIT_TOOLS parametrized test matrix.",
+      "assertions": [
+        "services/img-proc-mcp/app.py defines a new @mcp.tool() sharpen(image_s3_key: str, factor: ..., bbox: Optional[List[float]] = None) -> dict",
+        "sharpen uses _download_image to load the source image",
+        "sharpen uses _apply_in_place for the bbox-scoped path (not a bespoke crop/paste implementation)",
+        "sharpen returns via _finish(img, image_s3_key, \"sharpen\") producing output_s3_key/width/height",
+        "services/img-proc-mcp/tests/test_tools.py has a whole-image happy-path test for sharpen",
+        "services/img-proc-mcp/tests/test_tools.py has a bbox-scoped test for sharpen asserting pixels outside bbox are unchanged",
+        "services/agent/app.py defines a new @tool sharpen(...) -> str calling _call_image_edit_tool(\"sharpen\", {...})",
+        "sharpen.name is added to the TOOLS dict in services/agent/app.py",
+        "\"sharpen\" is added to IMAGE_EDIT_TOOL_NAMES in services/agent/app.py",
+        "No base64 image parameter or return value introduced anywhere",
+        "No changes made to services/yolo/app.py routes or response schemas",
+        "Existing rotate/flip/blur/resize/crop/add_noise tools and their tests remain unchanged"
+      ]
+    },
+    {
+      "name": "object-scoped-blur-flow",
+      "prompt": "A user says 'blur the second dog from the right' after uploading an image with multiple dogs. Trace/implement the flow so the agent correctly identifies and blurs only that dog, leaving the rest of the image untouched.",
+      "expected_output": "The agent calls detect_objects first, which returns a detections list (label, score, box) merged from YOLO's GET /prediction/{uid}. The LLM (per SYSTEM_PROMPT guidance) filters detections to label == 'dog', sorts by box[0] (x1) descending, and picks the second entry, then calls the blur tool with that detection's box passed as bbox. The blur MCP tool crops that region, blurs it, and pastes it back into the full image; pixels outside the bbox are byte-for-byte unchanged.",
+      "assertions": [
+        "services/agent/app.py's detect_objects tool calls GET /prediction/{uid} after a successful POST /predict when prediction_uid is present",
+        "detect_objects merges a detections list into its JSON output with id, label, score, and box (a parsed [x1,y1,x2,y2] list of floats, not a JSON string)",
+        "_parse_bbox in services/agent/app.py uses json.loads and raises ValueError on malformed input",
+        "SYSTEM_PROMPT in services/agent/app.py instructs sorting same-label detections by box[0] for left/right ordinal requests",
+        "The agent's blur @tool wrapper accepts a bbox argument and forwards it to call_mcp_tool alongside image_s3_key pulled from _current_working_image_s3_key",
+        "services/img-proc-mcp/app.py's blur tool, when given a bbox, crops the region via _clamp_bbox, applies ImageFilter.GaussianBlur only to that region, and pastes it back via _apply_in_place",
+        "A test exists asserting pixels strictly outside the bbox remain unchanged after a bbox-scoped blur call",
+        "No image pixel data appears in any LangChain message or tool argument - only S3 keys, labels, and numeric box coordinates"
+      ]
+    },
+    {
+      "name": "bbox-rotate-90-multiple-restriction",
+      "prompt": "Verify (or restore) that rotating a specific detected object only accepts angles that are multiples of 90, and that this restriction does not apply to whole-image rotation.",
+      "expected_output": "services/img-proc-mcp/app.py's rotate tool allows any angle when bbox is None (img.rotate(angle, expand=True)), but raises ValueError if bbox is given and angle % 90 != 0. When bbox is given and angle is a valid multiple of 90, the region is rotated via Image.Transpose (ROTATE_90/180/270), not img.rotate(angle, expand=False), to avoid black-filled corners on non-square regions.",
+      "assertions": [
+        "rotate(image_s3_key, angle, bbox=None) accepts arbitrary angle values",
+        "rotate(image_s3_key, angle, bbox=[...]) raises ValueError when angle is not a multiple of 90",
+        "rotate's bbox-scoped path uses Image.Transpose.ROTATE_90/ROTATE_180/ROTATE_270 (via a transpose lookup), not region.rotate(angle, expand=False)",
+        "A test exists verifying a bbox-scoped 90-degree rotation of a non-square region produces no black-filled pixels outside the original bbox content",
+        "A test exists verifying rotate raises ValueError for a non-90-multiple angle when bbox is provided",
+        "Whole-image rotation test confirms the canvas dimensions swap when expand=True changes them (e.g. a 90-degree rotation of a WxH image produces an HxW result)"
+      ]
+    }
+  ]
+}

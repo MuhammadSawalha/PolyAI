@@ -223,6 +223,47 @@ def test_predict_success_with_detections(mock_model, mock_download_image, mock_u
     mock_upload_image_bytes.assert_called_once()
 
 
+@patch("app.upload_image_bytes")
+@patch("app.download_image")
+@patch("app.model")
+def test_predict_annotated_image_converts_bgr_to_rgb(mock_model, mock_download_image, mock_upload_image_bytes, client):
+    """results[0].plot() returns a BGR numpy array (OpenCV convention) when it isn't already
+    a PIL Image - verify the saved annotated image converts it to RGB rather than passing
+    the raw (channel-swapped) array straight into Image.fromarray."""
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image_buffer, format="PNG")
+    mock_download_image.return_value = (image_buffer.getvalue(), "image/png")
+
+    mock_cls_tensor = MagicMock()
+    mock_cls_tensor.item.return_value = 0
+    mock_xyxy_tensor = MagicMock()
+    mock_xyxy_tensor.tolist.return_value = [10, 20, 30, 40]
+
+    fake_box = MagicMock()
+    fake_box.cls = [mock_cls_tensor]
+    fake_box.conf = [0.92]
+    fake_box.xyxy = [mock_xyxy_tensor]
+
+    # A BGR frame that's pure blue in OpenCV's B,G,R channel order - correctly converted
+    # to RGB this must render as pure blue (0,0,255), not red (255,0,0).
+    bgr_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    bgr_frame[:, :, 0] = 255  # the "B" channel in BGR order
+
+    fake_result = MagicMock()
+    fake_result.boxes = [fake_box]
+    fake_result.plot.return_value = bgr_frame
+
+    mock_model.return_value = [fake_result]
+    mock_model.names = {0: "dog"}
+
+    response = client.post("/predict", json={"image_s3_key": "chat-1/original/test_image.jpg"})
+    assert response.status_code == 200
+
+    uploaded_bytes = mock_upload_image_bytes.call_args[0][0]
+    saved_image = Image.open(io.BytesIO(uploaded_bytes)).convert("RGB")
+    assert saved_image.getpixel((0, 0)) == (0, 0, 255)
+
+
 def test_predict_invalid_file_extension(client):
     response = client.post(
         "/predict",

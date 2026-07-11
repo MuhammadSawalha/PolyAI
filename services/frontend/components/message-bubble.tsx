@@ -26,38 +26,7 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
           <p className="whitespace-pre-wrap">{message.content}</p>
         ) : (
           <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-ul:my-1 prose-li:my-0">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                // Intercept standard markdown link elements anchor tags <a>
-                a: ({ href, children }) => {
-                  // If the link points to your localhost prediction service, render it as an image directly!
-                  const isPredictionUrl = href?.includes('/prediction/') || href?.match(/\.(jpeg|jpg|gif|png)$/) != null;
-
-                  if (isPredictionUrl) {
-                    return (
-                      <div className="mt-3 block w-full max-w-md overflow-hidden rounded-lg border border-border bg-muted/40 shadow-sm">
-                        <img
-                          src={href}
-                          alt="Annotated View Result"
-                          className="w-full h-auto object-contain block"
-                          onError={(e) => {
-                            console.error("Image asset rendering failed from link source:", href);
-                          }}
-                        />
-                      </div>
-                    );
-                  }
-
-                  // Otherwise, render a normal link
-                  return (
-                    <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary underline hover:opacity-80">
-                      {children}
-                    </a>
-                  );
-                }
-              }}
-            >
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {message.content}
             </ReactMarkdown>
           </div>
@@ -88,6 +57,19 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
               />
             </div>
           )
+        )}
+        {message.edited_image && message.edited_image.length > 0 && (
+          <div className="mt-3 block w-full max-w-sm overflow-hidden rounded-lg border border-border bg-muted/40 shadow-sm">
+            <img
+              src={
+                message.edited_image.startsWith("data:")
+                  ? message.edited_image
+                  : `data:image/png;base64,${message.edited_image}`
+              }
+              alt="Edited Image Output"
+              className="w-full h-auto object-contain block"
+            />
+          </div>
         )}
       </div>
     </div>

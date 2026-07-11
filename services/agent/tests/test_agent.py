@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import pytest
@@ -5,7 +6,8 @@ import json
 import base64
 import httpx
 from unittest.mock import MagicMock, patch
-from langchain_core.messages import AIMessage, HumanMessage
+from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 # Set default test environment variables BEFORE importing app to prevent initialization crashes
 os.environ.setdefault("MODEL", "amazon.nova-lite-v1:0")
@@ -18,6 +20,18 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "fake")
 # Ensure the parent directory is in the path so we can import app
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import app
+
+
+def run_async(coro):
+    """Drive a coroutine with no real suspension points (test doubles only, no actual I/O)
+    to completion in the CURRENT context. Unlike asyncio.run()/run_until_complete(), which
+    wrap the coroutine in a Task and copy contextvars, this executes it directly so
+    ContextVar.set() calls made inside (e.g. by run_agent) are visible to the calling test."""
+    try:
+        coro.send(None)
+    except StopIteration as exc:
+        return exc.value
+    raise RuntimeError("coroutine unexpectedly suspended - it needs a real event loop")
 
 
 class FakeLLMWithTools:
@@ -50,12 +64,12 @@ class FakeLLMWithTools:
 
 
 class FakeDetectTool:
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": '{"prediction_uid":"prediction-123","predicted_image_s3_key":"chat-1/prediction-123/predicted/image.jpg"}'})()
 
 
 class FakeShowImageTool:
-    def invoke(self, tool_call):
+    async def ainvoke(self, tool_call):
         return type("FakeMessage", (), {"content": '{"image_url":"http://localhost:8080/prediction/prediction-123/image"}'})()
 
 
@@ -71,16 +85,31 @@ def test_run_agent_complete_workflow(monkeypatch):
     monkeypatch.setattr(app, "_fetch_annotated_image", lambda pid: "mocked_base64_string")
     monkeypatch.setattr(app, "MAX_INPUT_TOKENS", 500)
 
-    result = app.run_agent([HumanMessage(content="Detect and show image")])
+    result = run_async(app.run_agent([HumanMessage(content="Detect and show image")]))
 
     assert result["response"] == "I found 2 people in the image."
     assert result["prediction_id"] == "prediction-123"
+    assert result["predicted_image_s3_key"] == "chat-1/prediction-123/predicted/image.jpg"
     assert result["annotated_image"] == "mocked_base64_string"
     assert result["image_url"] == "http://localhost:8080/prediction/prediction-123/image"
     assert result["iterations"] == 3
     assert "detect_objects" in result["tools_called"]
     assert "show_annotated_image" in result["tools_called"]
     assert result["tokens_used"]["total"] == 150
+
+
+def test_run_agent_strips_hallucinated_markdown_image(monkeypatch):
+    """A model that hallucinates a markdown image reference in its final text must not have
+    that broken image syntax survive into the response returned to the frontend."""
+    class HallucinatingLLM:
+        def invoke(self, messages):
+            return AIMessage(content="Here is the rotated image:\n![Rotated Image](placeholder.png)")
+
+    monkeypatch.setattr(app, "llm_with_tools", HallucinatingLLM())
+
+    result = run_async(app.run_agent([HumanMessage(content="rotate and show me")]))
+    assert "![" not in result["response"]
+    assert result["response"] == "Here is the rotated image:"
 
 
 def test_run_agent_context_limit_flag(monkeypatch):
@@ -94,7 +123,7 @@ def test_run_agent_context_limit_flag(monkeypatch):
     monkeypatch.setattr(app, "llm_with_tools", HighTokenLLM())
     monkeypatch.setattr(app, "MAX_INPUT_TOKENS", 500)
 
-    result = app.run_agent([HumanMessage(content="Hello")])
+    result = run_async(app.run_agent([HumanMessage(content="Hello")]))
     assert result["context_limit_exceeded"] is True
 
 
@@ -110,7 +139,7 @@ def test_run_agent_stops_at_max_iterations(monkeypatch):
     monkeypatch.setattr(app, "llm_with_tools", AlwaysToolCallingLLM())
     monkeypatch.setattr(app, "TOOLS", {"detect_objects": FakeDetectTool()})
 
-    result = app.run_agent([HumanMessage(content="Loop")], max_iterations=1)
+    result = run_async(app.run_agent([HumanMessage(content="Loop")], max_iterations=1))
     assert result["context_limit_exceeded"] is True
     assert result["iterations"] == 1
 
@@ -120,8 +149,44 @@ def test_normalization_utilities():
     list_content = [{"type": "text", "text": "Hello "}, "World!"]
     normalized = app._normalize_response_content(list_content)
     assert normalized == "Hello World!"
-    
+
     assert app._normalize_response_content(404) == "404"
+
+
+def test_strip_markdown_images_removes_single_image():
+    text = "Here is the rotated image:\n![Rotated Image](some-broken-placeholder)"
+    assert app._strip_markdown_images(text) == "Here is the rotated image:"
+
+
+def test_strip_markdown_images_removes_multiple_images():
+    text = "Before ![a](url1) middle ![b](url2) after"
+    result = app._strip_markdown_images(text)
+    assert "![" not in result
+    assert "Before" in result and "middle" in result and "after" in result
+
+
+def test_strip_markdown_images_collapses_plain_links_to_their_text():
+    """The agent must never emit a real clickable link (the system prompt forbids it), so a
+    plain markdown link is collapsed to just its link text rather than left as a live link."""
+    text = "The image has been rotated. [See details](http://example.com/prediction/1)"
+    assert app._strip_markdown_images(text) == "The image has been rotated. See details"
+
+
+def test_strip_markdown_images_noop_on_plain_text():
+    assert app._strip_markdown_images("No images here at all.") == "No images here at all."
+
+
+def test_strip_markdown_images_removes_literal_image_placeholder():
+    text = "Here is the annotated image with the detected objects:\n<image>\nWould you like to make any edits?"
+    result = app._strip_markdown_images(text)
+    assert "<image>" not in result.lower()
+    assert "Here is the annotated image" in result
+    assert "Would you like to make any edits?" in result
+
+
+def test_strip_markdown_images_removes_closing_image_tag_case_insensitive():
+    text = "Done.</Image>"
+    assert app._strip_markdown_images(text) == "Done."
 
 
 def test_build_original_image_key_normalizes_extension():
@@ -211,11 +276,16 @@ def test_fetch_annotated_image_exceptions():
 
 
 def test_show_annotated_image_tool_full_execution():
-    """Verify successful runtime execution of show_annotated_image tool."""
+    """Verify successful runtime execution of show_annotated_image tool - image_url must only
+    live in the artifact (internal bookkeeping), never in the LLM-visible content, so the
+    model has no real URL in its context to leak back to the user."""
     app._current_prediction_id.set("prediction-123")
-    res = json.loads(app.show_annotated_image.invoke({}))
-    assert "image_url" in res
-    assert "prediction-123" in res["image_url"]
+    tool_call = {"name": "show_annotated_image", "args": {}, "id": "call_1", "type": "tool_call"}
+    tool_message = app.show_annotated_image.invoke(tool_call)
+    content = json.loads(tool_message.content)
+    assert "image_url" not in content
+    assert content == {"status": "ready"}
+    assert "prediction-123" in tool_message.artifact["image_url"]
 
 
 def test_show_annotated_image_tool_ordering():
@@ -227,23 +297,59 @@ def test_show_annotated_image_tool_ordering():
 
 @patch("httpx.Client")
 def test_detect_objects_tool_success(mock_client_class):
-    """Verify execution track of detect_objects tool under valid image state."""
+    """Verify execution track of detect_objects tool under valid image state, including the
+    follow-up GET /prediction/{uid} call that enriches the result with parsed bboxes."""
     app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
-    
+
     mock_client_instance = MagicMock()
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
-    mock_response.raise_for_status = MagicMock()
-    
-    mock_client_instance.post.return_value = mock_response
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"prediction_uid": "pred-abc", "objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+
+    mock_detail_response = MagicMock()
+    mock_detail_response.json.return_value = {
+        "detection_objects": [
+            {"id": 1, "label": "dog", "score": 0.9, "box": "[10.0, 20.0, 30.0, 40.0]"},
+        ]
+    }
+    mock_detail_response.raise_for_status = MagicMock()
+
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_client_instance.get.return_value = mock_detail_response
     mock_client_class.return_value.__enter__.return_value = mock_client_instance
 
-    res = json.loads(app.detect_objects.invoke({}))
-    assert res["prediction_uid"] == "pred-abc"
+    tool_call = {"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}
+    tool_message = app.detect_objects.invoke(tool_call)
+    content = json.loads(tool_message.content)
+    # prediction_uid/predicted_image_s3_key are internal bookkeeping and must NEVER be
+    # exposed in the LLM-visible content - only the artifact carries them, for run_agent's
+    # own use, so the model can't mistake an annotated-image S3 key for the current image.
+    assert "prediction_uid" not in content
+    assert content["detections"] == [{"id": 1, "label": "dog", "score": 0.9, "box": [10.0, 20.0, 30.0, 40.0]}]
+    assert tool_message.artifact["prediction_uid"] == "pred-abc"
     mock_client_instance.post.assert_called_once_with(
         f"{app.YOLO_SERVICE_URL}/predict",
         json={"image_s3_key": "chat-1/prediction-1/original/image.jpg"},
     )
+    mock_client_instance.get.assert_called_once_with(f"{app.YOLO_SERVICE_URL}/prediction/pred-abc")
+
+
+@patch("httpx.Client")
+def test_detect_objects_tool_success_without_prediction_uid(mock_client_class):
+    """If /predict responds without a prediction_uid, no follow-up GET call should happen."""
+    app._current_image_s3_key.set("chat-1/prediction-1/original/image.jpg")
+
+    mock_client_instance = MagicMock()
+    mock_predict_response = MagicMock()
+    mock_predict_response.json.return_value = {"objects": []}
+    mock_predict_response.raise_for_status = MagicMock()
+
+    mock_client_instance.post.return_value = mock_predict_response
+    mock_client_class.return_value.__enter__.return_value = mock_client_instance
+
+    content = json.loads(app.detect_objects.invoke({}))
+    assert content["detections"] == []
+    mock_client_instance.get.assert_not_called()
 
 
 @patch("httpx.Client")
@@ -310,9 +416,435 @@ def test_detect_objects_missing_image_context():
     assert "error" in error_response
 
 
+def test_reset_image_tool_success():
+    """reset_image should report status "reset" when the current image differs from the
+    original - i.e. there's actually something to discard."""
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    res = json.loads(app.reset_image.invoke({}))
+    assert res == {"status": "reset"}
+
+    app._current_original_image_s3_key.set(None)
+
+
+def test_reset_image_tool_already_original():
+    """reset_image should report status "already_original" as a no-op when no edits have
+    happened yet, rather than claiming a reset occurred."""
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    res = json.loads(app.reset_image.invoke({}))
+    assert res == {"status": "already_original"}
+
+    app._current_original_image_s3_key.set(None)
+
+
+def test_reset_image_tool_no_original_tracked():
+    """reset_image should return an error if no original image is tracked at all."""
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set(None)
+
+    res = json.loads(app.reset_image.invoke({}))
+    assert "error" in res
+
+
 def test_invalid_framework_model_constraints():
     """Ensure runtime system configuration constraints block invalid model descriptors."""
     with pytest.raises(SystemExit):
         app.MODEL = "unsupported_legacy_model"
         if app.MODEL not in app.ALLOWED_MODELS:
             raise SystemExit("Error path covered.")
+
+
+def test_parse_bbox_valid_json_string():
+    assert app._parse_bbox("[10.0, 20.0, 30.0, 40.0]") == [10.0, 20.0, 30.0, 40.0]
+
+
+def test_parse_bbox_malformed_string_raises():
+    with pytest.raises(ValueError):
+        app._parse_bbox("not json")
+
+
+def test_parse_bbox_wrong_shape_raises():
+    with pytest.raises(ValueError):
+        app._parse_bbox("[1, 2, 3]")
+
+
+class FakeRotateThenBlurLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "rotate", "args": {"angle": 90}, "id": "call_1", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "blur", "args": {"radius": 2.0}, "id": "call_2", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Rotated then blurred the image.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+class FakeImageEditTool:
+    def __init__(self, output_s3_key):
+        self.output_s3_key = output_s3_key
+
+    async def ainvoke(self, tool_call):
+        return type("FakeMessage", (), {"content": json.dumps({"output_s3_key": self.output_s3_key, "width": 10, "height": 10})})()
+
+
+def test_run_agent_chains_image_edits(monkeypatch):
+    """Verify rotate -> blur chaining updates the shared _current_image_s3_key and populates edited_image."""
+    fake_llm = FakeRotateThenBlurLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
+    })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate", "blur"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    result = run_async(app.run_agent([HumanMessage(content="rotate then blur")]))
+
+    assert result["response"] == "Rotated then blurred the image."
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_b.png"
+    assert result["current_image_s3_key"] == "chat-1/pred-1/edited/blur_b.png"
+    assert app._current_image_s3_key.get() == "chat-1/pred-1/edited/blur_b.png"
+
+
+class FakeRecordingImageEditTool:
+    """Like FakeImageEditTool, but records every tool_call it actually received so a test
+    can assert on the args run_agent ended up passing in."""
+
+    def __init__(self, output_s3_key):
+        self.output_s3_key = output_s3_key
+        self.received_tool_calls = []
+
+    async def ainvoke(self, tool_call):
+        self.received_tool_calls.append(tool_call)
+        return type("FakeMessage", (), {"content": json.dumps({"output_s3_key": self.output_s3_key, "width": 10, "height": 10})})()
+
+
+class FakeBlurWithWrongKeyLLM:
+    """Simulates a model that (incorrectly) supplies the annotated image's S3 key instead of
+    the actual current image for an edit tool call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blur",
+                    "args": {"radius": 2.0, "image_s3_key": "chat-1/pred-1/predicted/annotated_with_boxes.jpg"},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Blurred the image.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+def test_run_agent_overrides_wrong_image_s3_key_on_edit_tool_calls(monkeypatch):
+    """Regression test: even if the model supplies the wrong image_s3_key (e.g. the annotated
+    image's key instead of the current clean image), run_agent must force the edit tool call
+    to use the actual tracked current image - never trust the model's argument for this. This
+    is what makes "first edit uses the original, later edits build on the previous edit"
+    correct by construction instead of depending on the model picking the right key."""
+    fake_llm = FakeBlurWithWrongKeyLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    fake_blur_tool = FakeRecordingImageEditTool("chat-1/pred-1/edited/blur_a.png")
+    monkeypatch.setattr(app, "TOOLS", {"blur": fake_blur_tool})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"blur"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    result = run_async(app.run_agent([HumanMessage(content="blur the first person from the left")]))
+
+    assert len(fake_blur_tool.received_tool_calls) == 1
+    assert fake_blur_tool.received_tool_calls[0]["args"]["image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+    # The model-supplied edit args (radius, bbox, etc.) must still pass through untouched.
+    assert fake_blur_tool.received_tool_calls[0]["args"]["radius"] == 2.0
+    assert result["current_image_s3_key"] == "chat-1/pred-1/edited/blur_a.png"
+
+
+def test_run_agent_edit_invalidates_stale_annotation(monkeypatch):
+    """A successful edit must clear any prior detect_objects/show_annotated_image state,
+    since bounding boxes and the annotated image would no longer align with the new image."""
+    fake_llm = FakeRotateThenBlurLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_a.png"),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_b.png"),
+    })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate", "blur"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_prediction_id.set("stale-prediction")
+    app._current_predicted_image_s3_key.set("chat-1/pred-1/predicted/stale.jpg")
+
+    result = run_async(app.run_agent([HumanMessage(content="rotate then blur")]))
+
+    assert result["prediction_id"] is None
+    assert result["predicted_image_s3_key"] is None
+    assert app._current_prediction_id.get() is None
+    assert app._current_predicted_image_s3_key.get() is None
+
+
+class FakeResetLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "reset_image", "args": {}, "id": "call_1", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        msg = AIMessage(content="Reset the image back to the original.")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return msg
+
+
+class FakeResetTool:
+    """Mirrors app.reset_image's status logic without going through BaseTool.ainvoke's
+    executor-based sync-to-async bridging, which needs a real running event loop that
+    run_async (used by these tests) does not provide."""
+
+    async def ainvoke(self, tool_call):
+        original_key = app._current_original_image_s3_key.get()
+        content = json.dumps({"status": "reset"} if original_key else {"error": "No original image is available to reset to."})
+        return type("FakeMessage", (), {"content": content})()
+
+
+def test_run_agent_reset_image_restores_original(monkeypatch):
+    """A reset_image tool call must restore _current_image_s3_key to the original, populate
+    edited_image with the restored original's bytes, and invalidate stale prediction state -
+    mirroring how a normal edit is bookkept."""
+    fake_llm = FakeResetLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {"reset_image": FakeResetTool()})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/edited/blur_b.png")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_prediction_id.set("stale-prediction")
+    app._current_predicted_image_s3_key.set("chat-1/pred-1/predicted/stale.jpg")
+
+    result = run_async(app.run_agent([HumanMessage(content="reset the image")]))
+
+    assert result["response"] == "Reset the image back to the original."
+    assert result["current_image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/original/image.jpg"
+    assert app._current_image_s3_key.get() == "chat-1/pred-1/original/image.jpg"
+    assert result["prediction_id"] is None
+    assert result["predicted_image_s3_key"] is None
+    assert app._current_prediction_id.get() is None
+    assert app._current_predicted_image_s3_key.get() is None
+
+    app._current_original_image_s3_key.set(None)
+
+
+def test_run_agent_reset_image_noop_when_already_original(monkeypatch):
+    """If current already equals original, a reset_image call must not spuriously mark
+    anything as newly edited."""
+    fake_llm = FakeResetLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {"reset_image": FakeResetTool()})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    app._current_original_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+
+    result = run_async(app.run_agent([HumanMessage(content="reset the image")]))
+
+    assert result["edited_image"] is None
+    assert result["current_image_s3_key"] == "chat-1/pred-1/original/image.jpg"
+
+    app._current_original_image_s3_key.set(None)
+
+
+def test_run_agent_stops_at_max_iterations_populates_edited_image(monkeypatch):
+    """Verify the max-iterations safety fallback still surfaces an edited image if one was produced."""
+    class AlwaysRotateLLM:
+        def invoke(self, messages):
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "rotate", "args": {"angle": 90}, "id": "loop_id", "type": "tool_call"}],
+            )
+
+    monkeypatch.setattr(app, "llm_with_tools", AlwaysRotateLLM())
+    monkeypatch.setattr(app, "TOOLS", {"rotate": FakeImageEditTool("chat-1/pred-1/edited/rotate_c.png")})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"rotate"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+
+    result = run_async(app.run_agent([HumanMessage(content="Loop")], max_iterations=1))
+    assert result["context_limit_exceeded"] is True
+    assert result["edited_image"] == "base64_of_chat-1/pred-1/edited/rotate_c.png"
+
+
+def test_serialize_and_reconstruct_tool_trace_roundtrip():
+    """The trace serializer/deserializer must faithfully restore the real
+    AIMessage(tool_calls=...)/ToolMessage sequence, not just the final text."""
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}],
+        ),
+        ToolMessage(content='{"detections": [{"box": [1, 2, 3, 4]}]}', tool_call_id="call_1", name="detect_objects"),
+        AIMessage(content="Detected 1 object."),
+    ]
+
+    trace = app._serialize_tool_trace(messages)
+    restored = app._reconstruct_trace_messages(trace)
+
+    assert len(restored) == 3
+    assert isinstance(restored[0], AIMessage)
+    assert restored[0].tool_calls == messages[0].tool_calls
+    assert isinstance(restored[1], ToolMessage)
+    assert restored[1].content == messages[1].content
+    assert restored[1].tool_call_id == "call_1"
+    assert restored[1].name == "detect_objects"
+    assert isinstance(restored[2], AIMessage)
+    assert restored[2].content == "Detected 1 object."
+
+
+def test_serialize_tool_trace_returns_none_when_no_new_messages():
+    assert app._serialize_tool_trace([]) is None
+
+
+class FakeDetectObjectsTool:
+    async def ainvoke(self, tool_call):
+        return type("FakeMessage", (), {"content": json.dumps({
+            "prediction_uid": "pred-1",
+            "detections": [
+                {"label": "person", "score": 0.9, "box": [1, 2, 3, 4]},
+                {"label": "person", "score": 0.85, "box": [5, 6, 7, 8]},
+            ],
+        })})()
+
+
+class CapturingLLM:
+    """Fake LLM that records every `messages` list it was invoked with, so tests
+    can assert exactly what history was reconstructed for a given turn."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = 0
+        self.received_messages = []
+
+    def invoke(self, messages):
+        self.received_messages.append(messages)
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
+
+
+def test_chat_endpoint_restores_real_tool_trace_on_followup_turn(monkeypatch):
+    """Reproduces the reported bug: after 'blur the second person from the left' succeeds,
+    a follow-up 'blur the first one from the left' must still see the real detect_objects/blur
+    tool-call trace from the previous turn (not a flattened text-only history), so the LLM has
+    the box coordinates and tool-use context needed to act instead of skipping the tool call."""
+    client = TestClient(app.app)
+
+    turn1_llm = CapturingLLM([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "blur", "args": {"radius": 2.0, "bbox": [5, 6, 7, 8]}, "id": "call_2", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="The second person from the left has been blurred.",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+    ])
+    monkeypatch.setattr(app, "llm_with_tools", turn1_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "detect_objects": FakeDetectObjectsTool(),
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_1.jpg"),
+    })
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", {"blur"})
+    monkeypatch.setattr(app, "download_image_base64", lambda key: f"base64_of_{key}")
+    monkeypatch.setattr(app, "upload_base64_image", lambda image_b64, object_key: object_key)
+
+    resp1 = client.post("/chat", json={
+        "messages": [
+            {"role": "user", "content": "blur the second person from the left", "image_base64": base64.b64encode(b"fake").decode()},
+        ]
+    })
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["tool_trace"] is not None
+    trace_events = json.loads(data1["tool_trace"])
+    assert [e["role"] for e in trace_events] == ["ai", "tool", "ai", "tool", "ai"]
+
+    turn2_llm = CapturingLLM([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "blur", "args": {"radius": 2.0, "bbox": [1, 2, 3, 4]}, "id": "call_3", "type": "tool_call"}],
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+        AIMessage(
+            content="The first person from the left has been blurred too.",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
+    ])
+    monkeypatch.setattr(app, "llm_with_tools", turn2_llm)
+    monkeypatch.setattr(app, "TOOLS", {
+        "blur": FakeImageEditTool("chat-1/pred-1/edited/blur_2.jpg"),
+    })
+
+    resp2 = client.post("/chat", json={
+        "messages": [
+            {"role": "user", "content": "blur the second person from the left", "image_base64": base64.b64encode(b"fake").decode()},
+            {
+                "role": "assistant",
+                "content": data1["response"],
+                "current_image_s3_key": data1["current_image_s3_key"],
+                "prediction_id": data1["prediction_id"],
+                "predicted_image_s3_key": data1["predicted_image_s3_key"],
+                "tool_trace": data1["tool_trace"],
+            },
+            {"role": "user", "content": "blur the first one from the left"},
+        ]
+    })
+    assert resp2.status_code == 200
+    assert resp2.json()["edited_image"] == "base64_of_chat-1/pred-1/edited/blur_2.jpg"
+
+    # The reconstructed history handed to the LLM on turn 2 must contain the real
+    # tool_calls/ToolMessage sequence from turn 1 - not a single flattened text message.
+    first_call_messages = turn2_llm.received_messages[0]
+    tool_call_names = [
+        tc["name"]
+        for m in first_call_messages
+        if isinstance(m, AIMessage) and m.tool_calls
+        for tc in m.tool_calls
+    ]
+    assert "detect_objects" in tool_call_names
+    assert "blur" in tool_call_names
+
+    tool_message_contents = [m.content for m in first_call_messages if isinstance(m, ToolMessage)]
+    assert any("detections" in c for c in tool_message_contents)
