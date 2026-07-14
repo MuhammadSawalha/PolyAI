@@ -163,7 +163,7 @@ def predict(request: PredictRequest, db: Session = Depends(get_db)):
     if isinstance(annotated_frame, Image.Image):
         annotated_image = annotated_frame
     else:
-        annotated_image = Image.fromarray(annotated_frame)
+        annotated_image = Image.fromarray(annotated_frame[:, :, ::-1])  # BGR (OpenCV) -> RGB
     predicted_buffer = io.BytesIO()
     save_format = "PNG" if content_type == "image/png" else "JPEG"
     annotated_image.save(predicted_buffer, format=save_format)
