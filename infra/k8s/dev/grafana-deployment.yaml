@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:latest
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          volumeMounts:
+            - name: datasource
+              mountPath: /etc/grafana/provisioning/datasources/datasource.yml
+              subPath: datasource.yml
+            # grafana-dashboards is created manually via `kubectl create configmap
+            # --from-file` (see infra/k8s/README.md) because it holds the large
+            # pre-existing fastapi-observability.json export plus agent.json -
+            # hand-authoring that JSON into a YAML literal isn't practical.
+            - name: dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+      volumes:
+        - name: datasource
+          configMap:
+            name: grafana-datasource
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards

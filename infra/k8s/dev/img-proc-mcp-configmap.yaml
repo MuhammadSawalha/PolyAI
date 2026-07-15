@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: img-proc-mcp-config
+data:
+  AWS_REGION: "us-east-1"
+  AWS_S3_BUCKET: "sawalha-polyai-images"

@@ -22,8 +22,9 @@ logging.getLogger("langchain").setLevel(logging.DEBUG)
 logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram, CONTENT_TYPE_LATEST, generate_latest
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -625,12 +626,26 @@ app = FastAPI(title="Vision Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", 
+    allow_origins=["http://localhost:3000",
                    "http://sawalha.dev.fursa.click:3000" ,
-                   "http://sawalha.prod.fursa.click:3000"],
+                   "http://sawalha.prod.fursa.click:3000",
+                   # k8s frontend is only reachable via manual `kubectl port-forward`
+                   # (no NodePort/Ingress) - dev forwards to localhost:3000 (already
+                   # covered above), prod forwards to localhost:3001. See infra/k8s/README.md.
+                   "http://localhost:3001"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
+
+CHAT_REQUESTS = Counter("agent_chat_requests_total", "Chat requests by status", ["status"])
+CHAT_LATENCY = Histogram("agent_chat_latency_seconds", "Chat request latency in seconds")
+CHAT_INPUT_TOKENS = Counter("agent_chat_input_tokens_total", "Cumulative input tokens across chat requests")
+CHAT_OUTPUT_TOKENS = Counter("agent_chat_output_tokens_total", "Cumulative output tokens across chat requests")
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 class ChatMessage(BaseModel):
@@ -650,6 +665,22 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat", response_model=AgentChatResponse)
 async def chat(request: ChatRequest):
+    start_time = time.perf_counter()
+    try:
+        result = await _chat_impl(request)
+        CHAT_REQUESTS.labels(status="success").inc()
+        tokens = result.get("tokens_used") or {}
+        CHAT_INPUT_TOKENS.inc(tokens.get("input", 0))
+        CHAT_OUTPUT_TOKENS.inc(tokens.get("output", 0))
+        return result
+    except Exception:
+        CHAT_REQUESTS.labels(status="error").inc()
+        raise
+    finally:
+        CHAT_LATENCY.observe(time.perf_counter() - start_time)
+
+
+async def _chat_impl(request: ChatRequest):
     lc_messages = []
     latest_image = None
     chat_id = str(uuid4())

@@ -50,6 +50,17 @@ services:
     networks:
       - polyai-net
 
+  fluent-bit:
+    image: fluent/fluent-bit:4.2.7
+    container_name: fluent-bit
+    environment:
+      - S3_LOGS_BUCKET=${S3_LOGS_BUCKET}
+      - AWS_REGION=${AWS_REGION}
+    volumes:
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log
+
   node-exporter:
     image: prom/node-exporter:latest
     container_name: node-exporter

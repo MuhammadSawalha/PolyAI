@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  labels:
+    app: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent
+  template:
+    metadata:
+      labels:
+        app: agent
+    spec:
+      containers:
+        - name: agent
+          image: muhammadsawalha/agent-service:0.0.3
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: agent-config
+            - secretRef:
+                name: agent-secrets
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10

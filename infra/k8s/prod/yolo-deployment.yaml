@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yolo
+  labels:
+    app: yolo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yolo
+  template:
+    metadata:
+      labels:
+        app: yolo
+    spec:
+      containers:
+        - name: yolo
+          image: muhammadsawalha/yolo-service:0.0.3
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: yolo-config
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10

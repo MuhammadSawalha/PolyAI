@@ -14,6 +14,7 @@ httpx
 boto3
 pydantic
 langchain-mcp-adapters
+prometheus-client
 
 # Testing
 pytest==7.4.0

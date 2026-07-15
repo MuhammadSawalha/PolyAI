@@ -1,0 +1,87 @@
+{
+  "title": "Agent Observability",
+  "uid": "agent-observability",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["agent"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Chat requests/min by status",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(agent_chat_requests_total[1m])) by (status) * 60",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqpm" }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Chat latency (p50/p95/p99)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(agent_chat_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(agent_chat_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(agent_chat_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Error rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(agent_chat_requests_total{status=\"error\"}[5m])) / sum(rate(agent_chat_requests_total[5m]))",
+          "legendFormat": "error rate"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Input/output tokens",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(agent_chat_input_tokens_total[1m]) * 60",
+          "legendFormat": "input tokens/min"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(agent_chat_output_tokens_total[1m]) * 60",
+          "legendFormat": "output tokens/min"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    }
+  ]
+}
