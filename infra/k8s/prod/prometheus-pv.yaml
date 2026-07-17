@@ -14,7 +14,7 @@ spec:
     driver: ebs.csi.aws.com
     # Fill in after creating the EBS volume (see infra/k8s/README.md step 3):
     # aws ec2 create-volume --size 5 --volume-type gp3 --availability-zone <worker-az> ...
-    volumeHandle: vol-REPLACE_ME_PROD
+    volumeHandle: vol-0a591e3528f4889e3
     fsType: ext4
   claimRef:
     name: prometheus-pvc
