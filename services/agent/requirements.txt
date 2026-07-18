@@ -15,6 +15,7 @@ boto3
 pydantic
 langchain-mcp-adapters
 prometheus-client
+prometheus-fastapi-instrumentator
 
 # Testing
 pytest==7.4.0

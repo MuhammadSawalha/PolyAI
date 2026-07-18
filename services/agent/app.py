@@ -5,6 +5,8 @@ import logging
 import os
 import posixpath
 import re
+import signal
+import sys
 import time
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
@@ -22,9 +24,10 @@ logging.getLogger("langchain").setLevel(logging.DEBUG)
 logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 
 import httpx
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import Counter, Histogram, CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -622,7 +625,21 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
     }
 
 
+is_shutting_down = False
+
 app = FastAPI(title="Vision Agent")
+
+# Expose /metrics endpoint with default process metrics + FastAPI HTTP metrics
+Instrumentator().instrument(app).expose(app)
+
+
+def handle_sigterm(signum, frame):
+    global is_shutting_down
+    is_shutting_down = True
+    logging.info("Received SIGTERM. Shutting down gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 app.add_middleware(
     CORSMiddleware,
@@ -641,11 +658,6 @@ CHAT_REQUESTS = Counter("agent_chat_requests_total", "Chat requests by status", 
 CHAT_LATENCY = Histogram("agent_chat_latency_seconds", "Chat request latency in seconds")
 CHAT_INPUT_TOKENS = Counter("agent_chat_input_tokens_total", "Cumulative input tokens across chat requests")
 CHAT_OUTPUT_TOKENS = Counter("agent_chat_output_tokens_total", "Cumulative output tokens across chat requests")
-
-
-@app.get("/metrics")
-def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 class ChatMessage(BaseModel):
@@ -754,6 +766,13 @@ async def _chat_impl(request: ChatRequest):
         _current_original_image_s3_key.reset(token_original_img_s3)
         _current_prediction_id.reset(token_pred)
         _current_predicted_image_s3_key.reset(token_predicted_key)
+
+
+@app.get("/ready")
+def ready():
+    if is_shutting_down:
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+    return {"status": "ready"}
 
 
 @app.get("/health")

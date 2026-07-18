@@ -3,8 +3,8 @@ kind: ConfigMap
 metadata:
   name: agent-config
 data:
-  YOLO_SERVICE_URL: "http://yolo:8080"
-  IMG_PROC_MCP_URL: "http://img-proc-mcp:9000/mcp"
+  YOLO_SERVICE_URL: "http://yolo-svc:8080"
+  IMG_PROC_MCP_URL: "http://img-proc-mcp-svc:9000/mcp"
   MODEL_PROVIDER: "bedrock_converse"
   MODEL: "amazon.nova-lite-v1:0"
   AWS_REGION: "us-east-1"

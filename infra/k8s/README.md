@@ -60,19 +60,26 @@ kubectl -n kube-system patch deployment metrics-server --type=json \
 ```
 Verify: `kubectl top nodes` must show real numbers, not an error, before continuing.
 
-## Step 3 - EBS CSI driver + volumes (Prometheus durable storage)
+## Step 3 - Worker node IAM role (EBS CSI driver + S3/Bedrock access)
 
-No IRSA since this isn't EKS - the CSI driver's AWS calls are authorized through the
-worker node's EC2 instance profile (same mechanism the app services already use for
-S3/Bedrock access).
+No IRSA since this isn't EKS - every AWS call a pod on the worker node makes (EBS volume
+attach/detach for Prometheus, S3 image bucket access for yolo/img-proc-mcp/agent, Bedrock
+model invocation for agent) is authorized through the **worker node's own EC2 instance
+profile** - the same mechanism already granting S3/Bedrock access on the existing dev/prod
+Compose EC2 hosts. There's no k8s Secret involved anywhere for this - `agent/app.py` never
+even reads `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GOOGLE_API_KEY` (it only uses
+`MODEL_PROVIDER=bedrock_converse`, which authenticates via boto3's default credential
+chain, i.e. this instance profile).
 
 1. Find the worker node's EC2 instance and its attached IAM role.
-2. Attach the AWS-managed policy `AmazonEBSCSIDriverPolicy`
-   (`arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy`) to that role.
+2. Attach three policies to that role:
+   - `AmazonEBSCSIDriverPolicy` (AWS-managed: `arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy`) - for the EBS CSI driver.
+   - `s3-image-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - S3 access for yolo/img-proc-mcp/agent.
+   - `sawalha-bedrock-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - Bedrock model invocation for agent.
 3. Note the worker's exact Availability Zone (EBS volumes are AZ-locked - the volume must
    be created in the same AZ as the worker node).
-4. Install the driver (cluster add-on infrastructure, not one of "your services" - the
-   no-Helm rule is about the app/Prometheus/Grafana Deployments you hand-write):
+4. Install the EBS CSI driver (cluster add-on infrastructure, not one of "your services" -
+   the no-Helm rule is about the app/Prometheus/Grafana Deployments you hand-write):
    ```bash
    kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.35"
    ```
@@ -88,22 +95,7 @@ S3/Bedrock access).
    (`spec.csi.volumeHandle`), replacing the `vol-REPLACE_ME_DEV` / `vol-REPLACE_ME_PROD`
    placeholders currently there.
 
-## Step 4 - Agent secrets (API keys - never committed to git)
-
-```bash
-kubectl create secret generic agent-secrets -n dev  --from-env-file=services/agent/.env.k8s-dev
-kubectl create secret generic agent-secrets -n prod --from-env-file=services/agent/.env.k8s-prod
-```
-Create `services/agent/.env.k8s-dev` and `services/agent/.env.k8s-prod` yourself, locally,
-each containing real values for:
-```
-OPENAI_API_KEY=...
-ANTHROPIC_API_KEY=...
-GOOGLE_API_KEY=...
-```
-Keep both files out of git (don't `git add` them).
-
-## Step 5 - Build the two frontend images
+## Step 4 - Build the two frontend images
 
 `NEXT_PUBLIC_AGENT_URL` is baked into the browser bundle at Next.js build time, and since
 there's no NodePort/Ingress, the frontend will only ever be reached by *you*, via your own
@@ -120,9 +112,9 @@ docker build --build-arg NEXT_PUBLIC_AGENT_URL=http://localhost:8001 \
 ```
 
 (`services/agent/app.py`'s CORS list already allows `http://localhost:3000` and
-`http://localhost:3001` - see Step 8 for which port maps to which environment.)
+`http://localhost:3001` - see Step 7 for which port maps to which environment.)
 
-## Step 6 - Grafana dashboards ConfigMap
+## Step 5 - Grafana dashboards ConfigMap
 
 Created from files rather than hand-authored YAML, since `fastapi-observability.json` is
 a large pre-existing export:
@@ -139,7 +131,7 @@ kubectl create configmap grafana-dashboards -n prod \
 ```
 (`node-exporter-full.json` is deliberately excluded - node-exporter isn't deployed here.)
 
-## Step 7 - Apply everything
+## Step 6 - Apply everything
 
 ```bash
 kubectl apply -f infra/k8s/dev/prometheus-pv.yaml
@@ -158,24 +150,24 @@ kubectl get pods -n dev
 kubectl get pods -n prod
 ```
 
-## Step 8 - Access it via port-forward
+## Step 7 - Access it via port-forward
 
 Pick a set of local ports per environment so dev and prod can run side by side without
-clashing. Suggested mapping (matches the URLs baked into the frontend images in Step 5):
+clashing. Suggested mapping (matches the URLs baked into the frontend images in Step 4):
 
 | | dev | prod |
 |---|---|---|
-| frontend | `kubectl port-forward svc/frontend 3000:3000 -n dev` | `kubectl port-forward svc/frontend 3001:3000 -n prod` |
-| agent | `kubectl port-forward svc/agent 8000:8000 -n dev` | `kubectl port-forward svc/agent 8001:8000 -n prod` |
-| grafana | `kubectl port-forward svc/grafana 3002:3000 -n dev` | `kubectl port-forward svc/grafana 3003:3000 -n prod` |
-| prometheus | `kubectl port-forward svc/prometheus 9090:9090 -n dev` | `kubectl port-forward svc/prometheus 9091:9090 -n prod` |
+| frontend | `kubectl port-forward svc/frontend-svc 3000:3000 -n dev` | `kubectl port-forward svc/frontend-svc 3001:3000 -n prod` |
+| agent | `kubectl port-forward svc/agent-svc 8000:8000 -n dev` | `kubectl port-forward svc/agent-svc 8001:8000 -n prod` |
+| grafana | `kubectl port-forward svc/grafana-svc 3002:3000 -n dev` | `kubectl port-forward svc/grafana-svc 3003:3000 -n prod` |
+| prometheus | `kubectl port-forward svc/prometheus-svc 9090:9090 -n dev` | `kubectl port-forward svc/prometheus-svc 9091:9090 -n prod` |
 
 Each `kubectl port-forward` command blocks in its own terminal (or run with `&`/`nohup` to
 background it). With frontend+agent forwarded for dev, open `http://localhost:3000` and
 send a chat message end-to-end. Same for prod at `http://localhost:3001` (agent forwarded
 to 8001).
 
-## Step 9 - Test the HPA (yolo)
+## Step 8 - Test the HPA (yolo)
 
 `yolo`'s `/predict` needs an image already in S3 (no raw upload endpoint):
 
@@ -184,7 +176,7 @@ aws s3 cp services/yolo/beatles.jpeg s3://sawalha-polyai-images/loadtest/beatles
 
 kubectl run loadgen -n dev --rm -it --restart=Never --image=curlimages/curl -- sh -c '
   for i in $(seq 1 8); do
-    ( while true; do curl -s -o /dev/null -X POST http://yolo:8080/predict \
+    ( while true; do curl -s -o /dev/null -X POST http://yolo-svc:8080/predict \
         -H "Content-Type: application/json" \
         -d "{\"image_s3_key\":\"loadtest/beatles.jpg\"}"; done ) &
   done; wait'
@@ -200,12 +192,12 @@ Stop the load (Ctrl-C, `kubectl delete pod loadgen -n dev` if it lingers) and wa
 replicas drop back to 1 after the ~5 minute cooldown. Repeat with `-n prod` if you want to
 verify prod's HPA too.
 
-## Step 10 - Verify Prometheus storage actually persists
+## Step 9 - Verify Prometheus storage actually persists
 
 ```bash
 kubectl delete pod -n dev -l app=prometheus
 kubectl get pods -n dev -w   # wait for the replacement pod to become Ready
-kubectl port-forward svc/prometheus 9090:9090 -n dev
+kubectl port-forward svc/prometheus-svc 9090:9090 -n dev
 ```
 Open `http://localhost:9090/graph` and confirm historical metrics from before the delete
 are still there (proves the PVC/EBS volume, not the pod's local disk, is where the data
