@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: img-proc-mcp
+  namespace: dev
   labels:
     app: img-proc-mcp
 spec:

@@ -42,10 +42,18 @@ kubeconfig to your laptop and run `kubectl` locally instead, you can skip the SS
 
 ## Step 1 - Namespaces
 
+Namespaces are defined as plain manifests (`infra/k8s/dev/namespace.yaml`,
+`infra/k8s/prod/namespace.yaml`) rather than created imperatively, and every namespaced
+object in each folder now declares its own `metadata.namespace` to match - so `dev/` and
+`prod/` are each fully self-contained and don't rely on an `-n` flag at apply time.
+
 ```bash
-kubectl create ns dev
-kubectl create ns prod
+kubectl apply -f infra/k8s/dev/namespace.yaml
+kubectl apply -f infra/k8s/prod/namespace.yaml
 ```
+(Step 6's bulk `kubectl apply -f infra/k8s/dev/` would create these too automatically -
+`kubectl apply` on a directory applies `Namespace` objects before namespaced ones
+regardless of file order - but applying it explicitly here first is clearer to follow.)
 
 ## Step 2 - metrics-server (required for the HPAs to read CPU%)
 
@@ -133,16 +141,17 @@ kubectl create configmap grafana-dashboards -n prod \
 
 ## Step 6 - Apply everything
 
-```bash
-kubectl apply -f infra/k8s/dev/prometheus-pv.yaml
-kubectl apply -f infra/k8s/prod/prometheus-pv.yaml
+Make sure you've already filled in the real `volumeHandle` in `infra/k8s/dev/prometheus-pv.yaml`
+/ `prod/prometheus-pv.yaml` (Step 3) before running this - everything in each folder,
+including the `Namespace` and the `PersistentVolume`, applies in one shot:
 
-kubectl apply -n dev  -f infra/k8s/dev/
-kubectl apply -n prod -f infra/k8s/prod/
+```bash
+kubectl apply -f infra/k8s/dev/
+kubectl apply -f infra/k8s/prod/
 ```
-(the `prometheus-pv.yaml` files are `PersistentVolume` objects, which are cluster-scoped,
-not namespaced - hence no `-n` on those two lines; everything else in each folder is
-namespaced and picks up `-n dev` / `-n prod` from the directory-wide apply.)
+No `-n` flag needed - every namespaced object in the folder already declares its own
+`metadata.namespace`, and the `Namespace`/`PersistentVolume`/`StorageClass` objects are
+cluster-scoped so a namespace flag wouldn't apply to them anyway.
 
 Check everything came up:
 ```bash
