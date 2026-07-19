@@ -14,6 +14,8 @@ spec:
       labels:
         app: grafana
     spec:
+      securityContext:
+        fsGroup: 472   # official grafana/grafana image runs as uid 472; ensures the volume is writable
       containers:
         - name: grafana
           image: grafana/grafana:latest
@@ -36,6 +38,8 @@ spec:
             # hand-authoring that JSON into a YAML literal isn't practical.
             - name: dashboards
               mountPath: /etc/grafana/provisioning/dashboards
+            - name: storage
+              mountPath: /var/lib/grafana
       volumes:
         - name: datasource
           configMap:
@@ -43,3 +47,8 @@ spec:
         - name: dashboards
           configMap:
             name: grafana-dashboards
+        # Dynamically provisioned via the ebs-sc StorageClass (grafana-pvc.yaml) -
+        # unlike Prometheus's static PV, no EBS volume is created ahead of time.
+        - name: storage
+          persistentVolumeClaim:
+            claimName: grafana-pvc

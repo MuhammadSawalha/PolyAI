@@ -112,7 +112,7 @@ docker build --build-arg NEXT_PUBLIC_AGENT_URL=http://localhost:8001 \
 ```
 
 (`services/agent/app.py`'s CORS list already allows `http://localhost:3000` and
-`http://localhost:3001` - see Step 7 for which port maps to which environment.)
+`http://localhost:3001` - see Step 8 for which port maps to which environment.)
 
 ## Step 5 - Grafana dashboards ConfigMap
 
@@ -150,7 +150,31 @@ kubectl get pods -n dev
 kubectl get pods -n prod
 ```
 
-## Step 7 - Access it via port-forward
+## Step 7 - Observe Grafana's PVC dynamically provision (Pending → Bound)
+
+Unlike Prometheus's manually-created EBS volume (static provisioning), Grafana's storage
+uses **dynamic provisioning**: `infra/k8s/dev/storageclass.yaml` defines a real
+`StorageClass` named `ebs-sc` (`provisioner: ebs.csi.aws.com`), and
+`infra/k8s/dev/grafana-pvc.yaml` just asks for `storageClassName: ebs-sc` - no EBS volume
+or PV is created ahead of time, and no `volumeHandle`/`claimRef` to fill in by hand.
+Because `ebs-sc` uses `volumeBindingMode: WaitForFirstConsumer`, the PVC stays `Pending`
+until a Pod that mounts it is actually scheduled onto a node - only then does the EBS CSI
+driver create the volume, in that node's exact Availability Zone.
+
+Watch it happen (both objects were already created by Step 6's bulk apply):
+```bash
+kubectl get pvc -n dev grafana-pvc -w
+```
+You should see it go `Pending` → `Bound` within a few seconds, once the `grafana` pod
+schedules. Then:
+```bash
+kubectl get pv                              # a new PV was auto-created - no grafana-pv.yaml exists anywhere in the repo
+kubectl describe pvc grafana-pvc -n dev      # shows the auto-created EBS volume ID
+```
+Repeat with `-n prod` to see prod's own `grafana-pvc` go through the same thing
+independently (a separate EBS volume, since each namespace's PVC provisions its own).
+
+## Step 8 - Access it via port-forward
 
 Pick a set of local ports per environment so dev and prod can run side by side without
 clashing. Suggested mapping (matches the URLs baked into the frontend images in Step 4):
@@ -167,7 +191,7 @@ background it). With frontend+agent forwarded for dev, open `http://localhost:30
 send a chat message end-to-end. Same for prod at `http://localhost:3001` (agent forwarded
 to 8001).
 
-## Step 8 - Test the HPA (yolo)
+## Step 9 - Test the HPA (yolo)
 
 `yolo`'s `/predict` needs an image already in S3 (no raw upload endpoint):
 
@@ -192,7 +216,7 @@ Stop the load (Ctrl-C, `kubectl delete pod loadgen -n dev` if it lingers) and wa
 replicas drop back to 1 after the ~5 minute cooldown. Repeat with `-n prod` if you want to
 verify prod's HPA too.
 
-## Step 9 - Verify Prometheus storage actually persists
+## Step 10 - Verify Prometheus storage actually persists
 
 ```bash
 kubectl delete pod -n dev -l app=prometheus
