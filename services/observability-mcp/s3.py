@@ -39,6 +39,23 @@ def list_log_objects(environment: str, prefix: str) -> list[str]:
     return keys
 
 
+def list_common_prefixes(environment: str, prefix: str) -> list[str]:
+    """Lists immediate 'subdirectories' under `prefix` (delimiter-scoped listing) -
+    e.g. list_common_prefixes(env, "logs/") returns ["logs/agent/", "logs/yolo/", ...]
+    without descending into each one."""
+    bucket = bucket_for(environment)
+    subdirs: list[str] = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+            for common_prefix in page.get("CommonPrefixes", []):
+                subdirs.append(common_prefix["Prefix"])
+    except ClientError as e:
+        logging.error(f"Failed to list common prefixes in s3://{bucket}/{prefix}: {e}")
+        raise
+    return subdirs
+
+
 def download_gzip_json_lines(environment: str, key: str) -> list[dict]:
     """Downloads a gzip'd, newline-delimited-JSON log object and parses it into records."""
     bucket = bucket_for(environment)

@@ -6,7 +6,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: manual-prod
+  storageClassName: ebs-sc
   resources:
     requests:
       storage: 5Gi

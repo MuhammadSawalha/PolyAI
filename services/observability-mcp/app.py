@@ -11,7 +11,7 @@ load_dotenv()
 
 from fastmcp import FastMCP
 
-from s3 import download_gzip_json_lines, list_log_objects
+from s3 import download_gzip_json_lines, list_common_prefixes, list_log_objects
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,64 +32,44 @@ def _prometheus_url(environment: str) -> str:
     return url.rstrip("/")
 
 
-# Matches an object key like logs/2026/07/15/<container-tag>_143005.gz - the
-# fluent-bit s3_key_format is /logs/%Y/%m/%d/$TAG[1]_%H%M%S.gz, and $TAG[1]
-# may not be a clean container name/id (depends on how fluent-bit's tail
-# plugin fills the wildcard "docker.*" tag) - keep the captured token opaque
-# and match against it with substring search rather than assuming an exact
-# format.
-_KEY_PATTERN = re.compile(r"logs/(\d{4})/(\d{2})/(\d{2})/(?P<token>.+)_(?P<hms>\d{6})\.gz$")
-
-
-def _day_prefixes(start: datetime, end: datetime) -> list[str]:
-    prefixes = []
-    day = start.date()
-    while day <= end.date():
-        prefixes.append(f"logs/{day.year:04d}/{day.month:02d}/{day.day:02d}/")
-        day += timedelta(days=1)
-    return prefixes
+# Matches an object key like logs/agent/2026/07/20/143005.gz - the fluent-bit
+# s3_key_format is /logs/$TAG[1]/%Y/%m/%d/%H%M%S.gz, where $TAG[1] is the
+# container_name captured by the rewrite_tag filter's rule (docker.* ->
+# service.<container_name>), so the top-level path segment is a clean,
+# deliberate container identifier - not an opaque token to substring-match.
+_KEY_PATTERN = re.compile(r"logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz$")
 
 
 def _key_timestamp(key: str) -> Optional[datetime]:
     m = _KEY_PATTERN.match(key)
     if not m:
         return None
-    year, month, day_num = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    year, month, day_num = int(m.group(2)), int(m.group(3)), int(m.group(4))
     hms = m.group("hms")
     hour, minute, second = int(hms[0:2]), int(hms[2:4]), int(hms[4:6])
     return datetime(year, month, day_num, hour, minute, second, tzinfo=timezone.utc)
 
 
 @mcp.tool()
-def list_shipping_containers(environment: str, days: int = 1) -> dict:
-    """List the distinct container log tokens that have shipped logs to S3 in the last `days` days for the given environment ('dev' or 'prod'). Returns {"containers": [str, ...]}."""
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    tokens = set()
-    for prefix in _day_prefixes(start, end):
-        for key in list_log_objects(environment, prefix):
-            m = _KEY_PATTERN.match(key)
-            if m:
-                tokens.add(m.group("token"))
-    return {"containers": sorted(tokens)}
+def list_shipping_containers(environment: str) -> dict:
+    """List the containers that have shipped logs to S3 for the given environment ('dev' or 'prod'). Returns {"containers": [str, ...]}."""
+    prefixes = list_common_prefixes(environment, "logs/")
+    containers = sorted(p.removeprefix("logs/").rstrip("/") for p in prefixes)
+    return {"containers": containers}
 
 
 @mcp.tool()
 def get_container_logs(environment: str, container: str, minutes: int = 5) -> dict:
-    """Fetch log lines shipped to S3 for a container (matched by substring against the container's log-shipping token) in the given environment over the last `minutes` minutes. Returns {"records": [{"time", "stream", "log", "host"}, ...]}."""
+    """Fetch log lines shipped to S3 for a container in the given environment over the last `minutes` minutes. Returns {"records": [{"time", "stream", "log", "host"}, ...]}."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=minutes)
     records = []
-    for prefix in _day_prefixes(start, end):
-        for key in list_log_objects(environment, prefix):
-            m = _KEY_PATTERN.match(key)
-            if not m or container not in m.group("token"):
-                continue
-            ts = _key_timestamp(key)
-            if ts is None or not (start <= ts <= end + timedelta(minutes=1)):
-                continue
-            for record in download_gzip_json_lines(environment, key):
-                records.append(record)
+    for key in list_log_objects(environment, f"logs/{container}/"):
+        ts = _key_timestamp(key)
+        if ts is None or not (start <= ts <= end + timedelta(minutes=1)):
+            continue
+        for record in download_gzip_json_lines(environment, key):
+            records.append(record)
     records.sort(key=lambda r: r.get("time", ""))
     return {"records": records}
 

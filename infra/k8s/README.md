@@ -5,9 +5,10 @@ namespaces on a self-managed (kubeadm) cluster. No Helm, no Kustomize, no operat
 (per instructor requirement) **no shared "base" folder** - `infra/k8s/` contains only two
 folders, `dev/` and `prod/`, each with its own full, self-contained set of manifests.
 Namespace-scoped bare service DNS names (`agent`, `yolo`, `prometheus`, ...) already
-resolve correctly per-namespace on their own, so the two folders are identical except for:
-the frontend Deployment's image tag, and Prometheus's PV/PVC (different EBS volume per
-environment).
+resolve correctly per-namespace on their own, so the two folders are identical except for
+the frontend Deployment's image tag - even Prometheus's and Grafana's storage is
+dynamically provisioned per-namespace via the same shared `ebs-sc` `StorageClass`, so
+there's no per-environment EBS volume ID to hand-manage anywhere anymore.
 
 **No NodePort/Ingress anywhere** (per instructor requirement) - every Service is
 `ClusterIP`, and every access path (browser to frontend/agent, you to Grafana/Prometheus)
@@ -84,24 +85,16 @@ chain, i.e. this instance profile).
    - `AmazonEBSCSIDriverPolicy` (AWS-managed: `arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy`) - for the EBS CSI driver.
    - `s3-image-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - S3 access for yolo/img-proc-mcp/agent.
    - `sawalha-bedrock-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - Bedrock model invocation for agent.
-3. Note the worker's exact Availability Zone (EBS volumes are AZ-locked - the volume must
-   be created in the same AZ as the worker node).
-4. Install the EBS CSI driver (cluster add-on infrastructure, not one of "your services" -
+3. Install the EBS CSI driver (cluster add-on infrastructure, not one of "your services" -
    the no-Helm rule is about the app/Prometheus/Grafana Deployments you hand-write):
    ```bash
    kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.35"
    ```
-5. Create two EBS volumes, one per environment:
-   ```bash
-   aws ec2 create-volume --size 5 --volume-type gp3 --availability-zone <worker-az> \
-     --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=prometheus-data-dev}]'
-   aws ec2 create-volume --size 5 --volume-type gp3 --availability-zone <worker-az> \
-     --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=prometheus-data-prod}]'
-   ```
-6. Take the two resulting `VolumeId`s (`vol-...`) and paste them into
-   `infra/k8s/dev/prometheus-pv.yaml` and `infra/k8s/prod/prometheus-pv.yaml`
-   (`spec.csi.volumeHandle`), replacing the `vol-REPLACE_ME_DEV` / `vol-REPLACE_ME_PROD`
-   placeholders currently there.
+
+That's it - no `aws ec2 create-volume` and no volume ID to paste anywhere. Both
+Prometheus's and Grafana's PVCs (`storageClassName: ebs-sc`) are dynamically provisioned:
+the CSI driver creates the actual EBS volume automatically, in whichever Availability Zone
+the pod that mounts it gets scheduled to, the first time that pod schedules (see Step 7).
 
 ## Step 4 - Build the two frontend images
 
@@ -141,17 +134,16 @@ kubectl create configmap grafana-dashboards -n prod \
 
 ## Step 6 - Apply everything
 
-Make sure you've already filled in the real `volumeHandle` in `infra/k8s/dev/prometheus-pv.yaml`
-/ `prod/prometheus-pv.yaml` (Step 3) before running this - everything in each folder,
-including the `Namespace` and the `PersistentVolume`, applies in one shot:
+Everything in each folder, including the `Namespace` and the `StorageClass`, applies in
+one shot - there's no volume ID or other placeholder to fill in anywhere first:
 
 ```bash
 kubectl apply -f infra/k8s/dev/
 kubectl apply -f infra/k8s/prod/
 ```
 No `-n` flag needed - every namespaced object in the folder already declares its own
-`metadata.namespace`, and the `Namespace`/`PersistentVolume`/`StorageClass` objects are
-cluster-scoped so a namespace flag wouldn't apply to them anyway.
+`metadata.namespace`, and the `Namespace`/`StorageClass` objects are cluster-scoped so a
+namespace flag wouldn't apply to them anyway.
 
 Check everything came up:
 ```bash
@@ -159,29 +151,30 @@ kubectl get pods -n dev
 kubectl get pods -n prod
 ```
 
-## Step 7 - Observe Grafana's PVC dynamically provision (Pending → Bound)
+## Step 7 - Observe Prometheus's and Grafana's PVCs dynamically provision (Pending → Bound)
 
-Unlike Prometheus's manually-created EBS volume (static provisioning), Grafana's storage
-uses **dynamic provisioning**: `infra/k8s/dev/storageclass.yaml` defines a real
-`StorageClass` named `ebs-sc` (`provisioner: ebs.csi.aws.com`), and
-`infra/k8s/dev/grafana-pvc.yaml` just asks for `storageClassName: ebs-sc` - no EBS volume
-or PV is created ahead of time, and no `volumeHandle`/`claimRef` to fill in by hand.
-Because `ebs-sc` uses `volumeBindingMode: WaitForFirstConsumer`, the PVC stays `Pending`
-until a Pod that mounts it is actually scheduled onto a node - only then does the EBS CSI
-driver create the volume, in that node's exact Availability Zone.
+Both Prometheus's and Grafana's storage use **dynamic provisioning**:
+`infra/k8s/dev/storageclass.yaml` defines a real `StorageClass` named `ebs-sc`
+(`provisioner: ebs.csi.aws.com`), and `prometheus-pvc.yaml`/`grafana-pvc.yaml` just ask
+for `storageClassName: ebs-sc` - no EBS volume or PV is created ahead of time, and no
+`volumeHandle`/`claimRef` to fill in by hand anywhere. Because `ebs-sc` uses
+`volumeBindingMode: WaitForFirstConsumer`, each PVC stays `Pending` until a Pod that
+mounts it is actually scheduled onto a node - only then does the EBS CSI driver create the
+volume, in that node's exact Availability Zone.
 
-Watch it happen (both objects were already created by Step 6's bulk apply):
+Watch it happen (all four PVCs were already created by Step 6's bulk apply):
 ```bash
-kubectl get pvc -n dev grafana-pvc -w
+kubectl get pvc -n dev -w
 ```
-You should see it go `Pending` → `Bound` within a few seconds, once the `grafana` pod
-schedules. Then:
+You should see `prometheus-pvc` and `grafana-pvc` both go `Pending` → `Bound` within a few
+seconds, once their respective pods schedule. Then:
 ```bash
-kubectl get pv                              # a new PV was auto-created - no grafana-pv.yaml exists anywhere in the repo
-kubectl describe pvc grafana-pvc -n dev      # shows the auto-created EBS volume ID
+kubectl get pv                                  # two new PVs were auto-created - no *-pv.yaml exists anywhere in the repo
+kubectl describe pvc prometheus-pvc -n dev       # shows the auto-created EBS volume ID
+kubectl describe pvc grafana-pvc -n dev          # same, for grafana's own volume
 ```
-Repeat with `-n prod` to see prod's own `grafana-pvc` go through the same thing
-independently (a separate EBS volume, since each namespace's PVC provisions its own).
+Repeat with `-n prod` to see prod's own PVCs go through the same thing independently
+(separate EBS volumes - each namespace's PVCs provision their own).
 
 ## Step 8 - Access it via port-forward
 
