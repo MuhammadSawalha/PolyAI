@@ -28,15 +28,21 @@ def list_log_objects(environment: str, prefix: str) -> list[str]:
     """Lists S3 object keys for the given environment's log bucket under `prefix`."""
     bucket = bucket_for(environment)
     keys: list[str] = []
+    
+    # Check both with and without a leading slash to ensure we catch all objects
+    clean_prefix = prefix.lstrip("/")
+    prefixes_to_check = {clean_prefix, f"/{clean_prefix}"}
+    
     paginator = s3_client.get_paginator("list_objects_v2")
     try:
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                keys.append(obj["Key"])
+        for p in prefixes_to_check:
+            for page in paginator.paginate(Bucket=bucket, Prefix=p):
+                for obj in page.get("Contents", []):
+                    keys.append(obj["Key"])
     except ClientError as e:
         logging.error(f"Failed to list objects in s3://{bucket}/{prefix}: {e}")
         raise
-    return keys
+    return list(set(keys))
 
 
 def list_common_prefixes(environment: str, prefix: str) -> list[str]:
@@ -45,15 +51,20 @@ def list_common_prefixes(environment: str, prefix: str) -> list[str]:
     without descending into each one."""
     bucket = bucket_for(environment)
     subdirs: list[str] = []
+    
+    clean_prefix = prefix.lstrip("/")
+    prefixes_to_check = {clean_prefix, f"/{clean_prefix}"}
+    
     paginator = s3_client.get_paginator("list_objects_v2")
     try:
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-            for common_prefix in page.get("CommonPrefixes", []):
-                subdirs.append(common_prefix["Prefix"])
+        for p in prefixes_to_check:
+            for page in paginator.paginate(Bucket=bucket, Prefix=p, Delimiter="/"):
+                for common_prefix in page.get("CommonPrefixes", []):
+                    subdirs.append(common_prefix["Prefix"])
     except ClientError as e:
         logging.error(f"Failed to list common prefixes in s3://{bucket}/{prefix}: {e}")
         raise
-    return subdirs
+    return list(set(subdirs))
 
 
 def download_gzip_json_lines(environment: str, key: str) -> list[dict]:

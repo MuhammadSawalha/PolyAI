@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: yolo
-          image: muhammadsawalha/yolo-service:0.0.3
+          image: muhammadsawalha/yolo-service:457205dc6f20a4a065f6db0ec5e5e5b7547fedb7
           ports:
             - containerPort: 8080
           envFrom:
