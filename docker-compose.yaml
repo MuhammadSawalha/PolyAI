@@ -4,6 +4,12 @@ services:
   frontend:
     image: muhammadsawalha/frontend-service:${FRONTEND_IMAGE_TAG}
     container_name: frontend
+    labels:
+      - "container_name=frontend"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "3000:3000"
     depends_on:
@@ -14,6 +20,12 @@ services:
   agent:
     image: muhammadsawalha/agent-service:${AGENT_IMAGE_TAG}
     container_name: agent
+    labels:
+      - "container_name=agent"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "8000:8000"
     env_file:
@@ -29,6 +41,12 @@ services:
   yolo:
     image: muhammadsawalha/yolo-service:${YOLO_IMAGE_TAG}
     container_name: yolo
+    labels:
+      - "container_name=yolo"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "8080:8080"
     env_file:
@@ -41,6 +59,12 @@ services:
   img-proc-mcp:
     image: muhammadsawalha/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG}
     container_name: img-proc-mcp
+    labels:
+      - "container_name=img-proc-mcp"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "9000:9000"
     env_file:
@@ -53,6 +77,13 @@ services:
   fluent-bit:
     image: fluent/fluent-bit:4.2.7
     container_name: fluent-bit
+    labels:
+      - "container_name=fluent-bit"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
+    restart: unless-stopped
     environment:
       - S3_LOGS_BUCKET=${S3_LOGS_BUCKET}
       - AWS_REGION=${AWS_REGION}
@@ -64,6 +95,12 @@ services:
   node-exporter:
     image: prom/node-exporter:latest
     container_name: node-exporter
+    labels:
+      - "container_name=node-exporter"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     pid: host
     volumes:
       - /proc:/host/proc:ro
@@ -82,6 +119,12 @@ services:
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
+    labels:
+      - "container_name=prometheus"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "9090:9090"
     volumes:
@@ -97,6 +140,12 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
+    labels:
+      - "container_name=grafana"
+    logging:
+      driver: json-file
+      options:
+        labels: container_name
     ports:
       - "3001:3000"
     volumes:

@@ -32,12 +32,8 @@ def _prometheus_url(environment: str) -> str:
     return url.rstrip("/")
 
 
-# Matches an object key like logs/agent/2026/07/20/143005.gz - the fluent-bit
-# s3_key_format is /logs/$TAG[1]/%Y/%m/%d/%H%M%S.gz, where $TAG[1] is the
-# container_name captured by the rewrite_tag filter's rule (docker.* ->
-# service.<container_name>), so the top-level path segment is a clean,
-# deliberate container identifier - not an opaque token to substring-match.
-_KEY_PATTERN = re.compile(r"logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz$")
+# Updated regex to make the leading slash optional: /logs/... or logs/...
+_KEY_PATTERN = re.compile(r"/?logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz$")
 
 
 def _key_timestamp(key: str) -> Optional[datetime]:
@@ -53,23 +49,63 @@ def _key_timestamp(key: str) -> Optional[datetime]:
 @mcp.tool()
 def list_shipping_containers(environment: str) -> dict:
     """List the containers that have shipped logs to S3 for the given environment ('dev' or 'prod'). Returns {"containers": [str, ...]}."""
-    prefixes = list_common_prefixes(environment, "logs/")
-    containers = sorted(p.removeprefix("logs/").rstrip("/") for p in prefixes)
+    # Handle both /logs/ and logs/
+    prefixes = list_common_prefixes(environment, "logs/") or list_common_prefixes(environment, "/logs/")
+    containers = sorted(p.lstrip("/").removeprefix("logs/").rstrip("/") for p in prefixes)
     return {"containers": containers}
 
 
+def _parse_minutes(val: object) -> int:
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        val = val.lower().strip()
+        if val.endswith("m"):
+            return int(val[:-1])
+        if val.endswith("h"):
+            return int(val[:-1]) * 60
+        if val.endswith("d"):
+            return int(val[:-1]) * 1440
+        if val.isdigit():
+            return int(val)
+    return 240  # Default to 4 hours (240 mins) if unspecified or unparseable
+
+
 @mcp.tool()
-def get_container_logs(environment: str, container: str, minutes: int = 5) -> dict:
-    """Fetch log lines shipped to S3 for a container in the given environment over the last `minutes` minutes. Returns {"records": [{"time", "stream", "log", "host"}, ...]}."""
+def get_container_logs(
+    environment: str, 
+    container: Optional[str] = None, 
+    container_name: Optional[str] = None, 
+    minutes: Optional[object] = 240,
+    time_window: Optional[object] = None
+) -> dict:
+    """Fetch log lines shipped to S3 for a container in the given environment."""
+    target_container = container_name or container
+    if not target_container:
+        raise ValueError("Must provide either 'container' or 'container_name'")
+
+    # Extract minutes from whichever argument the AI sends
+    win = time_window or minutes
+    num_minutes = _parse_minutes(win)
+
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=minutes)
+    start = end - timedelta(minutes=num_minutes)
     records = []
-    for key in list_log_objects(environment, f"logs/{container}/"):
+    
+    s3_keys = set(
+        list_log_objects(environment, f"logs/{target_container}/") + 
+        list_log_objects(environment, f"/logs/{target_container}/")
+    )
+    
+    for key in s3_keys:
         ts = _key_timestamp(key)
-        if ts is None or not (start <= ts <= end + timedelta(minutes=1)):
+        # If timestamp is parsed, check if it falls in our start/end window
+        if ts is not None and not (start <= ts <= end + timedelta(hours=1)):
             continue
+            
         for record in download_gzip_json_lines(environment, key):
             records.append(record)
+            
     records.sort(key=lambda r: r.get("time", ""))
     return {"records": records}
 

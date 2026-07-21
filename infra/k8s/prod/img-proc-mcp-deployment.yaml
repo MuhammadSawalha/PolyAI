@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: img-proc-mcp
-          image: muhammadsawalha/img-proc-mcp-service:0.0.3
+          image: muhammadsawalha/img-proc-mcp-service:ab6450c80dcec742f9b238ec8242b513a33dda17
           ports:
             - containerPort: 9000
           envFrom:
