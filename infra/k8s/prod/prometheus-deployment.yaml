@@ -8,10 +8,6 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    # A ReadWriteOnce EBS volume can only be attached to one pod at a time.
-    # Recreate kills the old pod before starting the new one instead of the
-    # default RollingUpdate, which would otherwise try to start the
-    # replacement pod (and its PVC mount) before the old one has released it.
     type: Recreate
   selector:
     matchLabels:
@@ -22,7 +18,7 @@ spec:
         app: prometheus
     spec:
       securityContext:
-        fsGroup: 65534   # prometheus runs as user nobody (65534); ensures the volume is writable
+        fsGroup: 65534
       containers:
         - name: prometheus
           image: prom/prometheus:latest

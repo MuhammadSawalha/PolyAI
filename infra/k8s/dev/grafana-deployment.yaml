@@ -16,27 +16,30 @@ spec:
         app: grafana
     spec:
       securityContext:
-        fsGroup: 472   # official grafana/grafana image runs as uid 472; ensures the volume is writable
+        fsGroup: 472   
       containers:
         - name: grafana
           image: grafana/grafana:latest
           ports:
             - containerPort: 3000
+          env:
+            - name: GF_AUTH_BASIC_ENABLED
+              value: "true"
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: admin123
           resources:
             requests:
               cpu: 100m
               memory: 128Mi
             limits:
-              cpu: 300m
-              memory: 256Mi
+              cpu: 500m
+              memory: 1Gi
           volumeMounts:
             - name: datasource
               mountPath: /etc/grafana/provisioning/datasources/datasource.yml
               subPath: datasource.yml
-            # grafana-dashboards is created manually via `kubectl create configmap
-            # --from-file` (see infra/k8s/README.md) because it holds the large
-            # pre-existing fastapi-observability.json export plus agent.json -
-            # hand-authoring that JSON into a YAML literal isn't practical.
             - name: dashboards
               mountPath: /etc/grafana/provisioning/dashboards
             - name: storage
@@ -48,8 +51,6 @@ spec:
         - name: dashboards
           configMap:
             name: grafana-dashboards
-        # Dynamically provisioned via the ebs-sc StorageClass (grafana-pvc.yaml) -
-        # unlike Prometheus's static PV, no EBS volume is created ahead of time.
         - name: storage
           persistentVolumeClaim:
             claimName: grafana-pvc

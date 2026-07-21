@@ -4,5 +4,6 @@ metadata:
   name: img-proc-mcp-config
   namespace: dev
 data:
+  PORT: "9000"
   AWS_REGION: "us-east-1"
   AWS_S3_BUCKET: "sawalha-polyai-images"
