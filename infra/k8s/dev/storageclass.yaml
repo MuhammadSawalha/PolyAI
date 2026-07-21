@@ -1,0 +1,12 @@
+# StorageClass is cluster-scoped (not namespaced) - this identical file also exists in
+# prod/ so each folder stays self-contained; applying it from either or both is idempotent
+# since both create/update the same single "ebs-sc" object.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+reclaimPolicy: Delete

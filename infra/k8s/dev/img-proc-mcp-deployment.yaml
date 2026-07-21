@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: img-proc-mcp
+  namespace: dev
+  labels:
+    app: img-proc-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: img-proc-mcp
+  template:
+    metadata:
+      labels:
+        app: img-proc-mcp
+    spec:
+      containers:
+        - name: img-proc-mcp
+          image: muhammadsawalha/img-proc-mcp-service:0.0.3
+          ports:
+            - containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: img-proc-mcp-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 300m
+              memory: 512Mi

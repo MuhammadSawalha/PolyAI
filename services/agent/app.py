@@ -5,6 +5,8 @@ import logging
 import os
 import posixpath
 import re
+import signal
+import sys
 import time
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
@@ -24,6 +26,8 @@ logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -621,16 +625,39 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
     }
 
 
+is_shutting_down = False
+
 app = FastAPI(title="Vision Agent")
+
+# Expose /metrics endpoint with default process metrics + FastAPI HTTP metrics
+Instrumentator().instrument(app).expose(app)
+
+
+def handle_sigterm(signum, frame):
+    global is_shutting_down
+    is_shutting_down = True
+    logging.info("Received SIGTERM. Shutting down gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", 
+    allow_origins=["http://localhost:3000",
                    "http://sawalha.dev.fursa.click:3000" ,
-                   "http://sawalha.prod.fursa.click:3000"],
+                   "http://sawalha.prod.fursa.click:3000",
+                   # k8s frontend is only reachable via manual `kubectl port-forward`
+                   # (no NodePort/Ingress) - dev forwards to localhost:3000 (already
+                   # covered above), prod forwards to localhost:3001. See infra/k8s/README.md.
+                   "http://localhost:3001"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
+
+CHAT_REQUESTS = Counter("agent_chat_requests_total", "Chat requests by status", ["status"])
+CHAT_LATENCY = Histogram("agent_chat_latency_seconds", "Chat request latency in seconds")
+CHAT_INPUT_TOKENS = Counter("agent_chat_input_tokens_total", "Cumulative input tokens across chat requests")
+CHAT_OUTPUT_TOKENS = Counter("agent_chat_output_tokens_total", "Cumulative output tokens across chat requests")
 
 
 class ChatMessage(BaseModel):
@@ -650,6 +677,22 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat", response_model=AgentChatResponse)
 async def chat(request: ChatRequest):
+    start_time = time.perf_counter()
+    try:
+        result = await _chat_impl(request)
+        CHAT_REQUESTS.labels(status="success").inc()
+        tokens = result.get("tokens_used") or {}
+        CHAT_INPUT_TOKENS.inc(tokens.get("input", 0))
+        CHAT_OUTPUT_TOKENS.inc(tokens.get("output", 0))
+        return result
+    except Exception:
+        CHAT_REQUESTS.labels(status="error").inc()
+        raise
+    finally:
+        CHAT_LATENCY.observe(time.perf_counter() - start_time)
+
+
+async def _chat_impl(request: ChatRequest):
     lc_messages = []
     latest_image = None
     chat_id = str(uuid4())
@@ -723,6 +766,13 @@ async def chat(request: ChatRequest):
         _current_original_image_s3_key.reset(token_original_img_s3)
         _current_prediction_id.reset(token_pred)
         _current_predicted_image_s3_key.reset(token_predicted_key)
+
+
+@app.get("/ready")
+def ready():
+    if is_shutting_down:
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+    return {"status": "ready"}
 
 
 @app.get("/health")
