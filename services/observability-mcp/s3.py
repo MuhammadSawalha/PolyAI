@@ -5,6 +5,7 @@ import logging
 import os
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -14,7 +15,11 @@ _BUCKET_BY_ENV = {
     "prod": os.environ.get("PROD_S3_LOGS_BUCKET"),
 }
 
-s3_client = boto3.client("s3", region_name=AWS_REGION)
+s3_client = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    config=Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 3, "mode": "standard"}),
+)
 
 
 def bucket_for(environment: str) -> str:
@@ -25,14 +30,17 @@ def bucket_for(environment: str) -> str:
 
 
 def list_log_objects(environment: str, prefix: str) -> list[str]:
-    """Lists S3 object keys for the given environment's log bucket under `prefix`."""
+    """Lists S3 object keys for the given environment's log bucket under `prefix`.
+
+    Fluent Bit's s3_key_format has a leading slash, so shipped keys may or may not
+    have one depending on how the plugin normalizes it - check both variants.
+    """
     bucket = bucket_for(environment)
     keys: list[str] = []
-    
-    # Check both with and without a leading slash to ensure we catch all objects
+
     clean_prefix = prefix.lstrip("/")
     prefixes_to_check = {clean_prefix, f"/{clean_prefix}"}
-    
+
     paginator = s3_client.get_paginator("list_objects_v2")
     try:
         for p in prefixes_to_check:
