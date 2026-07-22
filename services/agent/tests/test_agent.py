@@ -848,3 +848,154 @@ def test_chat_endpoint_restores_real_tool_trace_on_followup_turn(monkeypatch):
 
     tool_message_contents = [m.content for m in first_call_messages if isinstance(m, ToolMessage)]
     assert any("detections" in c for c in tool_message_contents)
+
+
+class FakeMissingToolThenTextLLM:
+    """Simulates the LLM calling a tool name that isn't registered (e.g. img-proc-mcp
+    discovery failed at startup so 'blur' was never added to TOOLS), then reacting to the
+    graceful-fallback ToolMessage on its next turn."""
+
+    def __init__(self):
+        self.calls = 0
+        self.received_messages = []
+
+    def invoke(self, messages):
+        self.calls += 1
+        self.received_messages.append(list(messages))
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "blur", "args": {"radius": 2.0}, "id": "call_1", "type": "tool_call"}],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        return AIMessage(
+            content="Sorry, image editing is temporarily unavailable - please try again shortly.",
+            usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        )
+
+
+def test_run_agent_missing_tool_returns_graceful_toolmessage_instead_of_crashing(monkeypatch):
+    """If the LLM calls a tool name that isn't in TOOLS (e.g. img-proc-mcp discovery failed
+    at startup), run_agent must not raise KeyError - it should feed the LLM a ToolMessage
+    explaining the tool is unavailable and let it respond normally."""
+    fake_llm = FakeMissingToolThenTextLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", set())
+
+    result = run_async(app.run_agent([HumanMessage(content="blur the image")]))
+
+    assert result["response"] == "Sorry, image editing is temporarily unavailable - please try again shortly."
+    assert "blur" not in result["tools_called"]
+
+    # The second LLM call must have seen a tool-role message reporting the failure.
+    second_call_messages = fake_llm.received_messages[1]
+    tool_messages = [m for m in second_call_messages if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].name == "blur"
+    payload = json.loads(tool_messages[0].content)
+    assert "not currently available" in payload["error"]
+
+
+class FakeDetectThenMissingBlurLLM:
+    """A single turn where the model calls both a registered tool (detect_objects) and an
+    unregistered one (blur) - the missing tool must not block the registered one."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "detect_objects", "args": {}, "id": "call_1", "type": "tool_call"},
+                    {"name": "blur", "args": {"radius": 2.0}, "id": "call_2", "type": "tool_call"},
+                ],
+                usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+        return AIMessage(content="Found the objects, but couldn't blur.")
+
+
+def test_run_agent_missing_tool_does_not_block_other_tool_calls_in_same_turn(monkeypatch):
+    fake_llm = FakeDetectThenMissingBlurLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "TOOLS", {"detect_objects": FakeDetectTool()})
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", set())
+
+    result = run_async(app.run_agent([HumanMessage(content="detect and blur")]))
+
+    assert result["tools_called"] == ["detect_objects"]
+    assert result["prediction_id"] == "prediction-123"
+
+
+class CapturingSystemPromptLLM:
+    def __init__(self):
+        self.received_messages = None
+
+    def invoke(self, messages):
+        self.received_messages = list(messages)
+        return AIMessage(content="ok")
+
+
+def test_run_agent_image_context_omits_edit_tools_when_none_available(monkeypatch):
+    """If img-proc-mcp discovery never populated IMAGE_EDIT_TOOL_NAMES, the system prompt
+    must not claim rotate/blur/etc. are usable - it should tell the model they're unavailable."""
+    fake_llm = CapturingSystemPromptLLM()
+    monkeypatch.setattr(app, "llm_with_tools", fake_llm)
+    monkeypatch.setattr(app, "IMAGE_EDIT_TOOL_NAMES", set())
+
+    token = app._current_image_s3_key.set("chat-1/pred-1/original/image.jpg")
+    try:
+        run_async(app.run_agent([HumanMessage(content="blur it")]))
+    finally:
+        app._current_image_s3_key.reset(token)
+
+    system_message = fake_llm.received_messages[0]
+    assert "temporarily unavailable" in system_message.content
+    assert "requires this exact" not in system_message.content
+
+
+class FlakyThenOkClient:
+    """Fake MultiServerMCPClient.get_tools() that fails N times before succeeding, to test
+    _discover_img_edit_tools' retry/backoff behavior in isolation."""
+
+    def __init__(self, fail_times):
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    async def get_tools(self):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise ConnectionError("img-proc-mcp not reachable yet")
+        return ["tool-a", "tool-b"]
+
+
+class AlwaysFailingClient:
+    def __init__(self):
+        self.attempts = 0
+
+    async def get_tools(self):
+        self.attempts += 1
+        raise ConnectionError("img-proc-mcp not reachable")
+
+
+def test_discover_img_edit_tools_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(app.time, "sleep", lambda *_: None)
+    client = FlakyThenOkClient(fail_times=2)
+
+    result = app._discover_img_edit_tools(client, max_attempts=3, backoff_base=0.0)
+
+    assert result == ["tool-a", "tool-b"]
+    assert client.attempts == 3
+
+
+def test_discover_img_edit_tools_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(app.time, "sleep", lambda *_: None)
+    client = AlwaysFailingClient()
+
+    result = app._discover_img_edit_tools(client, max_attempts=3, backoff_base=0.0)
+
+    assert result == []
+    assert client.attempts == 3
