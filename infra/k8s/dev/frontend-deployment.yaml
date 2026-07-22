@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: muhammadsawalha/frontend-service:k8s-dev
+          image: muhammadsawalha/frontend-service:v2
           ports:
             - containerPort: 3000
           env:

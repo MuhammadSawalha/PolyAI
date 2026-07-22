@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -33,7 +34,8 @@ def _prometheus_url(environment: str) -> str:
 
 
 # Updated regex to make the leading slash optional: /logs/... or logs/...
-_KEY_PATTERN = re.compile(r"/?logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz$")
+#_KEY_PATTERN = re.compile(r"/?logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz$")
+_KEY_PATTERN = re.compile(r"/?logs/(?P<token>[^/]+)/(\d{4})/(\d{2})/(\d{2})/(?P<hms>\d{6})\.gz.*$")
 
 
 def _key_timestamp(key: str) -> Optional[datetime]:
@@ -90,22 +92,21 @@ def get_container_logs(
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=num_minutes)
+
+    # list_log_objects already checks both leading-slash prefix variants internally,
+    # so a single call covers every key format Fluent Bit may have produced.
+    s3_keys = list_log_objects(environment, f"logs/{target_container}/")
+
+    matched_keys = [
+        key for key in s3_keys
+        if (ts := _key_timestamp(key)) is not None and start <= ts <= end + timedelta(hours=1)
+    ]
+
     records = []
-    
-    s3_keys = set(
-        list_log_objects(environment, f"logs/{target_container}/") + 
-        list_log_objects(environment, f"/logs/{target_container}/")
-    )
-    
-    for key in s3_keys:
-        ts = _key_timestamp(key)
-        # If timestamp is parsed, check if it falls in our start/end window
-        if ts is not None and not (start <= ts <= end + timedelta(hours=1)):
-            continue
-            
-        for record in download_gzip_json_lines(environment, key):
-            records.append(record)
-            
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for result in pool.map(lambda key: download_gzip_json_lines(environment, key), matched_keys):
+            records.extend(result)
+
     records.sort(key=lambda r: r.get("time", ""))
     return {"records": records}
 
