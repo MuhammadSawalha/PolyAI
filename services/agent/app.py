@@ -5,6 +5,8 @@ import logging
 import os
 import posixpath
 import re
+import signal
+import sys
 import time
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from contextvars import ContextVar
@@ -24,6 +26,8 @@ logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -396,6 +400,28 @@ llm = init_chat_model(
     rate_limiter=rate_limiter
 )
 
+def _discover_img_edit_tools(client: MultiServerMCPClient, max_attempts: int = 4, backoff_base: float = 1.0) -> list:
+    """Retry MCP tool discovery with backoff so a slow-starting img-proc-mcp (e.g. right
+    after a k8s rollout) doesn't permanently strand this process with zero edit tools."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return asyncio.run(client.get_tools())
+        except Exception as exc:
+            if attempt == max_attempts:
+                logging.warning(
+                    f"Failed to discover tools from img-proc-mcp at {IMG_PROC_MCP_URL} "
+                    f"after {max_attempts} attempts: {exc}"
+                )
+                return []
+            delay = backoff_base * (2 ** (attempt - 1))
+            logging.warning(
+                f"Attempt {attempt}/{max_attempts} to discover tools from img-proc-mcp at "
+                f"{IMG_PROC_MCP_URL} failed: {exc}; retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+    return []
+
+
 # Discover the image-editing tools (rotate/flip/blur/resize/crop/add_noise) directly from the
 # img-proc-mcp server instead of hand-writing local proxy tools for each of them.
 mcp_client = MultiServerMCPClient({
@@ -404,11 +430,7 @@ mcp_client = MultiServerMCPClient({
         "transport": "http",
     }
 })
-try:
-    img_edit_tools = asyncio.run(mcp_client.get_tools())
-except Exception as exc:
-    logging.warning(f"Failed to discover tools from img-proc-mcp at {IMG_PROC_MCP_URL}: {exc}")
-    img_edit_tools = []
+img_edit_tools = _discover_img_edit_tools(mcp_client)
 IMAGE_EDIT_TOOL_NAMES = {t.name for t in img_edit_tools}
 
 # Registry: map tool name -> tool function
@@ -454,13 +476,19 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
       3. Repeat until the LLM returns a plain text response or max_iterations is reached.
     """
     current_key = _current_image_s3_key.get()
-    if current_key:
+    if current_key and IMAGE_EDIT_TOOL_NAMES:
         image_context = (
             f"\nCURRENT IMAGE: image_s3_key = \"{current_key}\". Every image-editing tool call "
             "(rotate, flip, blur, resize, crop, add_noise) requires this exact `image_s3_key` argument. "
             "Each edit returns a new `output_s3_key` - if you chain multiple edits in the same turn "
             "(e.g. rotate then blur), pass the previous edit's `output_s3_key` as the next call's "
             "`image_s3_key`, not the original."
+        )
+    elif current_key:
+        image_context = (
+            f"\nCURRENT IMAGE: image_s3_key = \"{current_key}\". Image-editing tools "
+            "(rotate/flip/blur/resize/crop/add_noise) are currently unavailable - if the user asks for "
+            "an edit, tell them image editing is temporarily unavailable and to try again shortly."
         )
     else:
         image_context = "\nNo image is currently available - if the user asks for an edit, tell them to upload one first."
@@ -526,7 +554,19 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
 
         for tool_call in response.tool_calls:
             tool_name = tool_call.get("name")
-            tool_fn = TOOLS[tool_name]
+            tool_fn = TOOLS.get(tool_name)
+
+            if tool_fn is None:
+                logging.warning(f"LLM requested tool '{tool_name}' which is not registered (unavailable/undiscovered)")
+                messages.append(ToolMessage(
+                    content=json.dumps({
+                        "error": f"Tool '{tool_name}' is not currently available.",
+                        "instruction": "Tell the user this capability is temporarily unavailable and they should try again shortly. Do not claim the action was performed.",
+                    }),
+                    tool_call_id=tool_call.get("id", ""),
+                    name=tool_name or "unknown_tool",
+                ))
+                continue
 
             if tool_name in IMAGE_EDIT_TOOL_NAMES:
                 # Never trust whatever image_s3_key the model supplied for an edit - always
@@ -621,16 +661,39 @@ async def run_agent(history: list, max_iterations: int = 10) -> dict:
     }
 
 
+is_shutting_down = False
+
 app = FastAPI(title="Vision Agent")
+
+# Expose /metrics endpoint with default process metrics + FastAPI HTTP metrics
+Instrumentator().instrument(app).expose(app)
+
+
+def handle_sigterm(signum, frame):
+    global is_shutting_down
+    is_shutting_down = True
+    logging.info("Received SIGTERM. Shutting down gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", 
+    allow_origins=["http://localhost:3000",
                    "http://sawalha.dev.fursa.click:3000" ,
-                   "http://sawalha.prod.fursa.click:3000"],
+                   "http://sawalha.prod.fursa.click:3000",
+                   # k8s frontend is only reachable via manual `kubectl port-forward`
+                   # (no NodePort/Ingress) - dev forwards to localhost:3000 (already
+                   # covered above), prod forwards to localhost:3001. See infra/k8s/README.md.
+                   "http://localhost:3001"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
+
+CHAT_REQUESTS = Counter("agent_chat_requests_total", "Chat requests by status", ["status"])
+CHAT_LATENCY = Histogram("agent_chat_latency_seconds", "Chat request latency in seconds")
+CHAT_INPUT_TOKENS = Counter("agent_chat_input_tokens_total", "Cumulative input tokens across chat requests")
+CHAT_OUTPUT_TOKENS = Counter("agent_chat_output_tokens_total", "Cumulative output tokens across chat requests")
 
 
 class ChatMessage(BaseModel):
@@ -650,6 +713,22 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat", response_model=AgentChatResponse)
 async def chat(request: ChatRequest):
+    start_time = time.perf_counter()
+    try:
+        result = await _chat_impl(request)
+        CHAT_REQUESTS.labels(status="success").inc()
+        tokens = result.get("tokens_used") or {}
+        CHAT_INPUT_TOKENS.inc(tokens.get("input", 0))
+        CHAT_OUTPUT_TOKENS.inc(tokens.get("output", 0))
+        return result
+    except Exception:
+        CHAT_REQUESTS.labels(status="error").inc()
+        raise
+    finally:
+        CHAT_LATENCY.observe(time.perf_counter() - start_time)
+
+
+async def _chat_impl(request: ChatRequest):
     lc_messages = []
     latest_image = None
     chat_id = str(uuid4())
@@ -723,6 +802,13 @@ async def chat(request: ChatRequest):
         _current_original_image_s3_key.reset(token_original_img_s3)
         _current_prediction_id.reset(token_pred)
         _current_predicted_image_s3_key.reset(token_predicted_key)
+
+
+@app.get("/ready")
+def ready():
+    if is_shutting_down:
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+    return {"status": "ready"}
 
 
 @app.get("/health")
