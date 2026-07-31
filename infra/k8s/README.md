@@ -17,6 +17,11 @@ goes through a manually-run `kubectl port-forward`.
 The old Docker Compose deployment on the two existing EC2 hosts keeps running unchanged
 throughout - nothing here touches it.
 
+> **Note:** As of the ArgoCD integration, `yolo`'s manifests (`infra/k8s/{dev,prod}/yolo/`)
+> are managed by ArgoCD (see `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD
+> auto-syncs `dev` on every push to the `dev` branch; `prod` requires a manual sync click
+> in the ArgoCD UI. The steps below still apply as-is to every other service.
+
 ---
 
 ## Step 0 - Access the cluster
@@ -144,6 +149,9 @@ kubectl apply -f infra/k8s/prod/
 No `-n` flag needed - every namespaced object in the folder already declares its own
 `metadata.namespace`, and the `Namespace`/`StorageClass` objects are cluster-scoped so a
 namespace flag wouldn't apply to them anyway.
+
+(Note: this applies everything except `yolo`, which now lives in a `yolo/` subfolder and
+is managed by ArgoCD instead - see the note near the top of this file.)
 
 Check everything came up:
 ```bash
