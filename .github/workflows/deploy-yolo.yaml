@@ -1,5 +1,8 @@
 name: Deploy Yolo Service
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [dev, main]
@@ -57,3 +60,47 @@ jobs:
             mv .env.tmp .env
             docker compose pull yolo
             docker compose up -d yolo
+
+  update-k8s-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Determine target environment
+        id: env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "name=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update image tag in manifest
+        run: |
+          set -e
+          FILE="infra/k8s/${{ steps.env.outputs.name }}/yolo/yolo-deployment.yaml"
+          sed -i -E "s#(image: muhammadsawalha/yolo-service:).*#\1${{ needs.build.outputs.image_tag }}#" "$FILE"
+
+      - name: Commit and push updated manifest
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- infra/k8s/${{ steps.env.outputs.name }}/yolo/yolo-deployment.yaml; then
+            echo "No manifest change (image tag already up to date) - nothing to commit."
+            exit 0
+          fi
+
+          git add infra/k8s/${{ steps.env.outputs.name }}/yolo/yolo-deployment.yaml
+          git commit -m "chore(yolo): deploy ${{ needs.build.outputs.image_tag }} to ${{ steps.env.outputs.name }} [skip ci]"
+
+          for i in 1 2 3; do
+            git pull --rebase origin ${{ github.ref_name }} && \
+            git push origin HEAD:${{ github.ref_name }} && break
+            echo "Push attempt $i failed, retrying..."
+            sleep $((i * 3))
+          done
