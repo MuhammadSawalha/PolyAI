@@ -106,7 +106,7 @@ else:
 # Download the AI model (tiny model ~6MB)
 model = YOLO("yolov8n.pt")
 
-# Initialize database tables
+# Initialize database tables.
 Base.metadata.create_all(bind=engine)
 
 
