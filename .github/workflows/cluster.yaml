@@ -1,0 +1,89 @@
+name: Provision & Bootstrap Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'AWS region to provision the cluster in (must match a tfvars file under infra/tf/tfvars/ and an existing Terraform workspace name)'
+        required: true
+        type: string
+        default: us-east-1
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    outputs:
+      control_plane_ip: ${{ steps.tf-output.outputs.control_plane_ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra/tf
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.TF_STATE_BUCKET_REGION }}"
+
+      - name: Select workspace
+        working-directory: infra/tf
+        run: terraform workspace select -or-create "${{ inputs.region }}"
+
+      - name: Terraform apply
+        working-directory: infra/tf
+        run: terraform apply -auto-approve -var-file="tfvars/${{ inputs.region }}.tfvars"
+
+      - name: Read control-plane IP
+        id: tf-output
+        working-directory: infra/tf
+        run: echo "control_plane_ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
+
+  bootstrap:
+    needs: provision
+    runs-on: ubuntu-latest
+    steps:
+      # This job runs once per cluster lifetime (per task6.md) but every step
+      # here is written to be safely re-runnable: `kubectl apply` is already
+      # idempotent, and the namespace/git-clone checks below just skip the
+      # create step if it already exists.
+      - name: Bootstrap cluster over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          script: |
+            set -e
+            export KUBECONFIG=/home/ubuntu/.kube/config
+
+            if [ -d /home/ubuntu/PolyAI/.git ]; then
+              cd /home/ubuntu/PolyAI
+              git fetch origin
+              git reset --hard origin/main
+            else
+              git clone https://github.com/MuhammadSawalha/PolyAI.git /home/ubuntu/PolyAI
+              cd /home/ubuntu/PolyAI
+            fi
+
+            # Calico CNI
+            kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+
+            # ArgoCD
+            kubectl get namespace argocd || kubectl create namespace argocd
+            kubectl apply -n argocd --server-side --force-conflicts \
+              -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+            kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
+
+            # One ArgoCD Application per microservice (dev auto-sync, prod manual sync) + app-of-apps
+            kubectl apply -f infra/k8s/argo/
+
+            echo "ArgoCD initial admin password:"
+            kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 --decode
+            echo

@@ -17,10 +17,11 @@ goes through a manually-run `kubectl port-forward`.
 The old Docker Compose deployment on the two existing EC2 hosts keeps running unchanged
 throughout - nothing here touches it.
 
-> **Note:** As of the ArgoCD integration, `yolo`'s manifests (`infra/k8s/{dev,prod}/yolo/`)
-> are managed by ArgoCD (see `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD
-> auto-syncs `dev` on every push to the `dev` branch; `prod` requires a manual sync click
-> in the ArgoCD UI. The steps below still apply as-is to every other service.
+> **Note:** As of the ArgoCD integration, `yolo`, `agent`, `frontend`, and `img-proc-mcp`'s
+> manifests (`infra/k8s/{dev,prod}/<service>/`) are managed by ArgoCD (see
+> `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD auto-syncs `dev` on every push
+> to the `dev` branch; `prod` requires a manual sync click in the ArgoCD UI. The steps
+> below still apply as-is to Grafana/Prometheus (the only services still applied manually).
 
 ---
 
@@ -150,8 +151,9 @@ No `-n` flag needed - every namespaced object in the folder already declares its
 `metadata.namespace`, and the `Namespace`/`StorageClass` objects are cluster-scoped so a
 namespace flag wouldn't apply to them anyway.
 
-(Note: this applies everything except `yolo`, which now lives in a `yolo/` subfolder and
-is managed by ArgoCD instead - see the note near the top of this file.)
+(Note: this applies everything except `yolo`, `agent`, `frontend`, and `img-proc-mcp`,
+which now live in their own subfolders and are managed by ArgoCD instead - see the note
+near the top of this file.)
 
 Check everything came up:
 ```bash
