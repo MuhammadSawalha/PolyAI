@@ -47,6 +47,23 @@ kubeconfig to your laptop and run `kubectl` locally instead, you can skip the SS
 
 ---
 
+## Step 0.5 - Bootstrap Calico + ArgoCD (one-time, after `terraform apply`)
+
+`infra/tf` provisions the control plane already `kubeadm init`-ed. Installing the
+CNI plugin, ArgoCD, and the `app-of-apps` `Application` (which in turn makes ArgoCD
+pick up every other `Application` in `infra/k8s/argo/` directly from git) is done by
+`infra/k8s/bootstrap.sh` - idempotent, safe to re-run:
+
+```bash
+git clone https://github.com/MuhammadSawalha/PolyAI.git
+cd PolyAI
+infra/k8s/bootstrap.sh
+```
+
+`.github/workflows/cluster.yaml`'s `bootstrap` job runs this same script (copied
+over via `scp` instead of a full clone) - see that workflow for the automated
+version of this step.
+
 ## Step 1 - Namespaces
 
 Namespaces are defined as plain manifests (`infra/k8s/dev/namespace.yaml`,
@@ -238,3 +255,22 @@ kubectl port-forward svc/prometheus-svc 9090:9090 -n dev
 Open `http://localhost:9090/graph` and confirm historical metrics from before the delete
 are still there (proves the PVC/EBS volume, not the pod's local disk, is where the data
 actually lives).
+
+## Step 11 - Scaling the worker Auto Scaling Group
+
+Set `asg_desired_capacity` in `infra/tf/tfvars/<region>.tfvars` and re-apply (or re-run
+`cluster.yaml`) to change the number of worker nodes - `0` when the cluster isn't in use,
+`1`-`3` otherwise (`asg_min_size`/`asg_max_size` bound it to that range).
+
+Scaling down terminates the corresponding EC2 instance(s), but Kubernetes doesn't find out
+on its own - the matching `Node` object(s) are left behind showing `NotReady`. This isn't
+cleaned up automatically (see the comment on `aws_autoscaling_group.workers` in
+`infra/tf/modules/k8s-cluster/main.tf` for why: it needs something reachable from both the
+ASG's termination lifecycle hook and the cluster API - a Lambda or SSM Run Command - which
+is more moving parts than this cluster's scale warrants). After scaling down, clean up the
+stale node(s) by hand:
+
+```bash
+kubectl get nodes                      # find the NotReady one(s)
+kubectl delete node <node-name>
+```

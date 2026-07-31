@@ -6,23 +6,33 @@ name: PolyAI CD (build, push, update k8s manifests)
 # see infra/k8s/argo/). This is the canonical place all 4 services' manifests
 # get updated; deploy-yolo.yaml's build/deploy jobs still build+push+deploy
 # yolo to the legacy Compose EC2 hosts separately, untouched by this workflow.
+#
+# Everything below runs as one sequential job with a single commit at the end
+# covering every changed service, rather than a parallel matrix each doing its
+# own commit - that avoids two matrix jobs ever racing to push to the same
+# branch at once, so there's no pull-rebase-push retry loop needed anywhere.
 
 on:
   push:
     branches: [dev, main]
     paths:
-      - 'services/**'
+      - 'services/agent/**'
+      - 'services/frontend/**'
+      - 'services/img-proc-mcp/**'
+      - 'services/yolo/**'
+      - '.github/workflows/cd.yaml'
 
 permissions:
   contents: write
 
 jobs:
-  detect-changes:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    outputs:
-      services: ${{ steps.filter.outputs.changes }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
 
       - uses: dorny/paths-filter@v3
         id: filter
@@ -32,21 +42,6 @@ jobs:
             agent: services/agent/**
             frontend: services/frontend/**
             img-proc-mcp: services/img-proc-mcp/**
-
-  build-and-update-manifest:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.services != '[]'
-    strategy:
-      matrix:
-        service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-
-      - id: tag
-        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Determine target environment
         id: env
@@ -58,64 +53,70 @@ jobs:
           fi
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.filter.outputs.changes != '[]'
 
       - uses: docker/login-action@v3
+        if: steps.filter.outputs.changes != '[]'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # frontend bakes NEXT_PUBLIC_AGENT_URL into the browser bundle at build
-      # time; there's no Ingress in the cluster, so it points at the port the
-      # agent is port-forwarded to for that environment (see infra/k8s/README.md
-      # Step 4: localhost:8000 for dev, localhost:8001 for prod).
-      - name: Set frontend build args
-        id: build-args
+      - name: Build, push, and patch manifests for each changed service
+        if: steps.filter.outputs.changes != '[]'
+        env:
+          TAG: ${{ github.sha }}
+          ENVIRONMENT: ${{ steps.env.outputs.name }}
+          CHANGED_SERVICES: ${{ steps.filter.outputs.changes }}
         run: |
-          if [ "${{ matrix.service }}" = "frontend" ]; then
-            if [ "${{ steps.env.outputs.name }}" = "prod" ]; then
-              echo "args=NEXT_PUBLIC_AGENT_URL=http://localhost:8001" >> "$GITHUB_OUTPUT"
-            else
-              echo "args=NEXT_PUBLIC_AGENT_URL=http://localhost:8000" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          for SERVICE in $(echo "$CHANGED_SERVICES" | jq -r '.[]'); do
+            echo "::group::$SERVICE"
+
+            # frontend bakes NEXT_PUBLIC_AGENT_URL into the browser bundle at
+            # build time; there's no Ingress in the cluster, so it points at
+            # the port the agent is port-forwarded to for that environment
+            # (see infra/k8s/README.md Step 4: localhost:8000 for dev,
+            # localhost:8001 for prod).
+            BUILD_ARG=""
+            if [ "$SERVICE" = "frontend" ]; then
+              if [ "$ENVIRONMENT" = "prod" ]; then
+                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=http://localhost:8001"
+              else
+                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=http://localhost:8000"
+              fi
             fi
-          else
-            echo "args=" >> "$GITHUB_OUTPUT"
-          fi
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: services/${{ matrix.service }}
-          file: services/${{ matrix.service }}/Dockerfile
-          push: true
-          build-args: ${{ steps.build-args.outputs.args }}
-          tags: muhammadsawalha/${{ matrix.service }}-service:${{ steps.tag.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.service }}-cd
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}-cd
+            docker buildx build \
+              --push \
+              ${BUILD_ARG:+--build-arg "$BUILD_ARG"} \
+              --cache-from "type=gha,scope=${SERVICE}-cd" \
+              --cache-to "type=gha,mode=max,scope=${SERVICE}-cd" \
+              --tag "muhammadsawalha/${SERVICE}-service:${TAG}" \
+              --file "services/${SERVICE}/Dockerfile" \
+              "services/${SERVICE}"
 
-      - name: Update image tag in manifest
+            FILE="infra/k8s/${ENVIRONMENT}/${SERVICE}/${SERVICE}-deployment.yaml"
+            sed -i -E "s#(image: muhammadsawalha/${SERVICE}-service:).*#\1${TAG}#" "$FILE"
+
+            echo "::endgroup::"
+          done
+
+      - name: Commit and push updated manifests
+        if: steps.filter.outputs.changes != '[]'
+        env:
+          ENVIRONMENT: ${{ steps.env.outputs.name }}
         run: |
-          set -e
-          FILE="infra/k8s/${{ steps.env.outputs.name }}/${{ matrix.service }}/${{ matrix.service }}-deployment.yaml"
-          sed -i -E "s#(image: muhammadsawalha/${{ matrix.service }}-service:).*#\1${{ steps.tag.outputs.tag }}#" "$FILE"
-
-      - name: Commit and push updated manifest
-        run: |
-          set -e
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          FILE="infra/k8s/${{ steps.env.outputs.name }}/${{ matrix.service }}/${{ matrix.service }}-deployment.yaml"
+          git add "infra/k8s/${ENVIRONMENT}"
 
-          if git diff --quiet -- "$FILE"; then
-            echo "No manifest change (image tag already up to date) - nothing to commit."
+          if git diff --cached --quiet; then
+            echo "No manifest changes (image tags already up to date) - nothing to commit."
             exit 0
           fi
 
-          git add "$FILE"
-          git commit -m "chore(${{ matrix.service }}): deploy ${{ steps.tag.outputs.tag }} to ${{ steps.env.outputs.name }} [skip ci]"
-
-          for i in 1 2 3; do
-            git pull --rebase origin ${{ github.ref_name }} && \
-            git push origin HEAD:${{ github.ref_name }} && break
-            echo "Push attempt $i failed, retrying..."
-            sleep $((i * 3))
-          done
+          git commit -m "chore(cd): deploy ${{ github.sha }} to ${ENVIRONMENT} [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
