@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: muhammadsawalha/agent-service:ce80da8468a5df9a72600c0628347cb923b923db
+          image: muhammadsawalha/agent-service:f6910658ec3d237950c3b1dd5fe296ee1c85ff34
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
