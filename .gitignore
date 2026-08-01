@@ -46,3 +46,12 @@ services/frontend/.next/
 services/frontend/node_modules/
 services/frontend/out/
 
+# Terraform
+infra/tf/**/.terraform/
+infra/tf/**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+

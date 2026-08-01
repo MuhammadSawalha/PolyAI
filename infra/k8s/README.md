@@ -17,10 +17,11 @@ goes through a manually-run `kubectl port-forward`.
 The old Docker Compose deployment on the two existing EC2 hosts keeps running unchanged
 throughout - nothing here touches it.
 
-> **Note:** As of the ArgoCD integration, `yolo`'s manifests (`infra/k8s/{dev,prod}/yolo/`)
-> are managed by ArgoCD (see `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD
-> auto-syncs `dev` on every push to the `dev` branch; `prod` requires a manual sync click
-> in the ArgoCD UI. The steps below still apply as-is to every other service.
+> **Note:** As of the ArgoCD integration, `yolo`, `agent`, `frontend`, and `img-proc-mcp`'s
+> manifests (`infra/k8s/{dev,prod}/<service>/`) are managed by ArgoCD (see
+> `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD auto-syncs `dev` on every push
+> to the `dev` branch; `prod` requires a manual sync click in the ArgoCD UI. The steps
+> below still apply as-is to Grafana/Prometheus (the only services still applied manually).
 
 ---
 
@@ -45,6 +46,23 @@ kubeconfig to your laptop and run `kubectl` locally instead, you can skip the SS
 `kubectl port-forward`'s `localhost` is then your own laptop already.
 
 ---
+
+## Step 0.5 - Bootstrap Calico + ArgoCD (one-time, after `terraform apply`)
+
+`infra/tf` provisions the control plane already `kubeadm init`-ed. Installing the
+CNI plugin, ArgoCD, and the `app-of-apps` `Application` (which in turn makes ArgoCD
+pick up every other `Application` in `infra/k8s/argo/` directly from git) is done by
+`infra/k8s/bootstrap.sh` - idempotent, safe to re-run:
+
+```bash
+git clone https://github.com/MuhammadSawalha/PolyAI.git
+cd PolyAI
+infra/k8s/bootstrap.sh
+```
+
+`.github/workflows/cluster.yaml`'s `bootstrap` job runs this same script (copied
+over via `scp` instead of a full clone) - see that workflow for the automated
+version of this step.
 
 ## Step 1 - Namespaces
 
@@ -150,8 +168,9 @@ No `-n` flag needed - every namespaced object in the folder already declares its
 `metadata.namespace`, and the `Namespace`/`StorageClass` objects are cluster-scoped so a
 namespace flag wouldn't apply to them anyway.
 
-(Note: this applies everything except `yolo`, which now lives in a `yolo/` subfolder and
-is managed by ArgoCD instead - see the note near the top of this file.)
+(Note: this applies everything except `yolo`, `agent`, `frontend`, and `img-proc-mcp`,
+which now live in their own subfolders and are managed by ArgoCD instead - see the note
+near the top of this file.)
 
 Check everything came up:
 ```bash
@@ -236,3 +255,22 @@ kubectl port-forward svc/prometheus-svc 9090:9090 -n dev
 Open `http://localhost:9090/graph` and confirm historical metrics from before the delete
 are still there (proves the PVC/EBS volume, not the pod's local disk, is where the data
 actually lives).
+
+## Step 11 - Scaling the worker Auto Scaling Group
+
+Set `asg_desired_capacity` in `infra/tf/tfvars/<region>.tfvars` and re-apply (or re-run
+`cluster.yaml`) to change the number of worker nodes - `0` when the cluster isn't in use,
+`1`-`3` otherwise (`asg_min_size`/`asg_max_size` bound it to that range).
+
+Scaling down terminates the corresponding EC2 instance(s), but Kubernetes doesn't find out
+on its own - the matching `Node` object(s) are left behind showing `NotReady`. This isn't
+cleaned up automatically (see the comment on `aws_autoscaling_group.workers` in
+`infra/tf/modules/k8s-cluster/main.tf` for why: it needs something reachable from both the
+ASG's termination lifecycle hook and the cluster API - a Lambda or SSM Run Command - which
+is more moving parts than this cluster's scale warrants). After scaling down, clean up the
+stale node(s) by hand:
+
+```bash
+kubectl get nodes                      # find the NotReady one(s)
+kubectl delete node <node-name>
+```

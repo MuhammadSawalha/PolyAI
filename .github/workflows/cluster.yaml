@@ -1,0 +1,179 @@
+name: Provision & Bootstrap Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'AWS region to provision the cluster in (must match a tfvars file under infra/tf/tfvars/ and an existing Terraform workspace name)'
+        required: true
+        type: string
+        default: us-east-1
+
+permissions:
+  contents: read
+
+# Guards against two runs racing the same Terraform workspace/state.
+concurrency:
+  group: polyai-cluster-${{ inputs.region }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    outputs:
+      control_plane_ip: ${{ steps.tf-output.outputs.control_plane_ip }}
+    defaults:
+      run:
+        working-directory: infra/tf
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Check regional configuration
+        run: |
+          set -euo pipefail
+          if [ ! -f "tfvars/${{ inputs.region }}.tfvars" ]; then
+            echo "Missing Terraform variables file: infra/tf/tfvars/${{ inputs.region }}.tfvars"
+            exit 1
+          fi
+
+      # Bootstraps its own remote-state bucket on first run instead of
+      # requiring it to be created by hand - deterministically named per
+      # account+region so it never collides with anyone else's bucket, and
+      # every step here is idempotent (head-bucket guards the create).
+      - name: Create Terraform state bucket
+        id: backend
+        run: |
+          set -euo pipefail
+
+          REGION="${{ inputs.region }}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="polyai-tfstate-${ACCOUNT_ID}-${REGION}"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+                --create-bucket-configuration "LocationConstraint=$REGION"
+            fi
+          fi
+
+          aws s3api put-bucket-versioning \
+            --bucket "$BUCKET" --versioning-configuration Status=Enabled
+
+          aws s3api put-public-access-block \
+            --bucket "$BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          aws s3api put-bucket-encryption \
+            --bucket "$BUCKET" \
+            --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.backend.outputs.bucket }}" \
+            -backend-config="region=${{ inputs.region }}"
+
+      - name: Select workspace
+        run: terraform workspace select -or-create "${{ inputs.region }}"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -var-file="tfvars/${{ inputs.region }}.tfvars"
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -var-file="tfvars/${{ inputs.region }}.tfvars"
+
+      - name: Read control-plane IP
+        id: tf-output
+        run: echo "control_plane_ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
+
+  bootstrap:
+    needs: provision
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `terraform apply` returns once the instance is `running`, not once its
+      # user-data (apt installs, `kubeadm init`, several minutes on t3.medium)
+      # has actually finished - jumping straight to SSH here would race it.
+      # `cloud-init status --wait` is the OS's own purpose-built signal for
+      # "user-data is done" (and surfaces a real `error` status if kubeadm
+      # init failed, instead of just hanging until a generic timeout like a
+      # marker-file poll would). The outer retry loop only covers the window
+      # before SSH itself is even reachable.
+      - name: Wait for control-plane initialization to finish
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          HOST: ${{ needs.provision.outputs.control_plane_ip }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/control-plane.pem
+          chmod 600 ~/.ssh/control-plane.pem
+
+          echo "Waiting for SSH and cloud-init to finish on $HOST..."
+          for i in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/control-plane.pem \
+                 "ubuntu@$HOST" 'sudo cloud-init status --wait' 2>/dev/null; then
+              echo "Control plane is ready."
+              exit 0
+            fi
+            echo "Attempt $i/60 - not ready yet, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Timed out waiting for the control plane to finish initializing."
+          exit 1
+
+      - name: Copy bootstrap script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/bootstrap.sh"
+          target: "/home/ubuntu/cluster-bootstrap"
+          strip_components: 2
+
+      - name: Copy app-of-apps manifest
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/argo/app-of-apps.yaml"
+          target: "/home/ubuntu/cluster-bootstrap/argo"
+          strip_components: 3
+
+      - name: Run bootstrap
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          script: |
+            chmod +x /home/ubuntu/cluster-bootstrap/bootstrap.sh
+            /home/ubuntu/cluster-bootstrap/bootstrap.sh
