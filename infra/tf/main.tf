@@ -29,7 +29,7 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.8"
 
-  name = "polyai-${terraform.workspace}"
+  name = "sawalha-polyai-${terraform.workspace}"
   cidr = var.vpc_cidr
 
   azs             = slice(data.aws_availability_zones.available.names, 0, 2)
@@ -47,7 +47,7 @@ module "vpc" {
 module "k8s_cluster" {
   source = "./modules/k8s-cluster"
 
-  name_prefix       = "polyai-${terraform.workspace}"
+  name_prefix       = "sawalha-polyai-${terraform.workspace}"
   region            = var.region
   vpc_id            = module.vpc.vpc_id
   vpc_cidr          = module.vpc.vpc_cidr_block
