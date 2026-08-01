@@ -31,6 +31,7 @@ kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
 # every other Application (yolo/agent/frontend/img-proc-mcp, dev+prod)
 # directly from git - nothing else ever needs to be applied here, now or for
 # any future microservice.
+
 kubectl apply -f "$SCRIPT_DIR/argo/app-of-apps.yaml"
 
 echo "ArgoCD initial admin password:"
