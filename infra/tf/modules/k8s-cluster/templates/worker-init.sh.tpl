@@ -25,7 +25,16 @@ sysctl --system
 
 # --- cri-o, kubelet, kubeadm ---
 apt-get update
-apt-get install -y software-properties-common curl gpg apt-transport-https ca-certificates awscli
+apt-get install -y software-properties-common curl gpg apt-transport-https ca-certificates unzip
+
+# AWS CLI v2 (single static binary via the official installer) instead of the
+# apt-packaged v1, which pulls in ~100 unrelated packages (imagemagick,
+# ghostscript, full font-rendering stacks) - real, avoidable boot-time/CPU/
+# disk weight on a t3.medium.
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 mkdir -p /etc/apt/keyrings
 
@@ -68,4 +77,21 @@ if [ -z "$JOIN_COMMAND" ]; then
   exit 1
 fi
 
-eval "$JOIN_COMMAND --cri-socket=unix:///var/run/crio/crio.sock"
+# The control plane's API server can still be warming up (leader election,
+# cert setup) right after it publishes the join command, so a join attempt
+# can transiently fail (e.g. "client rate limiter Wait returned an error")
+# even though the command itself is valid. Retry instead of treating one
+# bad-timing attempt as fatal; reset between attempts so a partially-applied
+# join doesn't block the next one.
+for i in $(seq 1 10); do
+  if eval "$JOIN_COMMAND --cri-socket=unix:///var/run/crio/crio.sock"; then
+    echo "Successfully joined the cluster."
+    exit 0
+  fi
+  echo "kubeadm join failed (attempt $i/10), resetting and retrying in 15s..."
+  kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock >/dev/null 2>&1 || true
+  sleep 15
+done
+
+echo "kubeadm join did not succeed after 10 attempts." >&2
+exit 1
