@@ -60,14 +60,25 @@ systemctl enable kubelet
 # this worker boots in parallel with it, not after it. A worker that finishes
 # its lighter apt-only setup first would otherwise hit ParameterNotFound on a
 # one-shot fetch, so retry here instead of failing immediately.
+# The SSM parameter is created by Terraform with a "PENDING" placeholder
+# value (see aws_ssm_parameter.join_command) and only overwritten with a real
+# join command once the control plane finishes kubeadm init - a plain "did
+# the fetch succeed" check isn't enough, since a successful fetch can still
+# return that placeholder if this worker is faster than the control plane.
 JOIN_COMMAND=""
 for i in $(seq 1 60); do
-  JOIN_COMMAND=$(aws ssm get-parameter \
+  FETCHED=$(aws ssm get-parameter \
     --region "${region}" \
     --name "${ssm_param_name}" \
     --with-decryption \
     --query 'Parameter.Value' \
-    --output text 2>/dev/null) && break
+    --output text 2>/dev/null || true)
+
+  if [ -n "$FETCHED" ] && [ "$FETCHED" != "PENDING" ]; then
+    JOIN_COMMAND="$FETCHED"
+    break
+  fi
+
   echo "Join command not published yet, retrying in 10s... ($i/60)"
   sleep 10
 done
