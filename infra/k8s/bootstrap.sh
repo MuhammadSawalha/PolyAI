@@ -16,25 +16,28 @@ set -euo pipefail
 export KUBECONFIG=/home/ubuntu/.kube/config
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- wait for at least one worker node before installing anything ---
+# --- wait for at least one worker node to exist before installing anything ---
 # The control plane is tainted NoSchedule, so nothing but DaemonSets can run
 # there - both Calico's kube-controllers Deployment and the whole ArgoCD
 # stack need an actual worker. The worker boots in parallel with (not after)
-# the control plane and typically takes longer to become Ready (kubeadm init
-# here vs. just package installs + kubeadm join there), so wait for one
-# explicitly instead of racing it and hitting the rollout-status timeout below.
-echo "Waiting for at least one worker node to be Ready..."
+# the control plane, so wait for its Node object to register instead of
+# racing it.
+#
+# Deliberately checking for the Node object's existence, NOT status=Ready:
+# no node (control plane included) can report Ready until Calico's CNI is
+# installed, which is the very next step below - requiring Ready here would
+# wait on a condition this script hasn't made possible yet.
+echo "Waiting for at least one worker node to register..."
 for i in $(seq 1 60); do
-  if kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers 2>/dev/null \
-      | awk '{print $2}' | grep -q '^Ready$'; then
-    echo "Worker node is Ready."
+  if kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers 2>/dev/null | grep -q .; then
+    echo "Worker node has registered."
     break
   fi
   if [ "$i" -eq 60 ]; then
     echo "Timed out waiting for a worker node to join." >&2
     exit 1
   fi
-  echo "No Ready worker yet, retrying in 10s... ($i/60)"
+  echo "No worker node yet, retrying in 10s... ($i/60)"
   sleep 10
 done
 
