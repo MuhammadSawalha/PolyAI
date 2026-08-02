@@ -25,7 +25,17 @@ sysctl --system
 
 # --- cri-o, kubelet, kubeadm, kubectl ---
 apt-get update
-apt-get install -y software-properties-common curl gpg apt-transport-https ca-certificates awscli
+apt-get install -y software-properties-common curl gpg apt-transport-https ca-certificates unzip
+
+# AWS CLI v2 (single static binary via the official installer) instead of the
+# apt-packaged v1, which pulls in ~100 unrelated packages (imagemagick,
+# ghostscript, full font-rendering stacks) - real, avoidable boot-time/CPU/
+# disk weight on a t3.medium that's already tight running the full control
+# plane.
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 mkdir -p /etc/apt/keyrings
 
