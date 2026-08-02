@@ -156,6 +156,30 @@ resource "aws_iam_instance_profile" "worker" {
   role = aws_iam_role.worker.name
 }
 
+# --- Worker join-command handoff ---
+# A Terraform-managed placeholder so `destroy` actually removes it - a raw
+# `aws ssm put-parameter` from inside user-data alone would leave this
+# parameter behind across destroy/recreate cycles, letting a fast-booting
+# worker fetch a stale join command still pointing at a control plane from a
+# previous, already-destroyed generation (its IP long gone, so the join can
+# never succeed). Terraform only owns the parameter's existence here, not its
+# value: the control plane overwrites it with the real join command at boot
+# (control-plane-init.sh.tpl), and workers reject the "PENDING" placeholder
+# until that overwrite has actually happened (worker-init.sh.tpl).
+resource "aws_ssm_parameter" "join_command" {
+  name  = "/${var.name_prefix}/join-command"
+  type  = "SecureString"
+  value = "PENDING"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = {
+    Name = "${var.name_prefix}-join-command"
+  }
+}
+
 # --- Control plane ---
 
 resource "aws_instance" "control_plane" {
@@ -175,7 +199,7 @@ resource "aws_instance" "control_plane" {
   user_data = templatefile("${path.module}/templates/control-plane-init.sh.tpl", {
     kubernetes_version = var.kubernetes_version
     region             = var.region
-    ssm_param_name     = "/${var.name_prefix}/join-command"
+    ssm_param_name     = aws_ssm_parameter.join_command.name
   })
 
   tags = {
@@ -209,7 +233,7 @@ resource "aws_launch_template" "worker" {
   user_data = base64encode(templatefile("${path.module}/templates/worker-init.sh.tpl", {
     kubernetes_version = var.kubernetes_version
     region             = var.region
-    ssm_param_name     = "/${var.name_prefix}/join-command"
+    ssm_param_name     = aws_ssm_parameter.join_command.name
   }))
 
   tag_specifications {
