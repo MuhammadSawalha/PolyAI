@@ -44,6 +44,23 @@ done
 # --- Calico CNI ---
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
 
+# --- metrics-server ---
+# Required for the agent/frontend/yolo HPAs to read CPU% - without it every
+# HPA sits at FailedGetResourceMetric forever, which ArgoCD reports as the
+# whole Application being Degraded even though the underlying Deployment is
+# healthy. kubeadm clusters need the --kubelet-insecure-tls patch since
+# kubelet's self-signed serving certs aren't in a chain metrics-server trusts
+# by default. The patch itself isn't idempotent (kubectl patch --type=json
+# "add" would append a duplicate arg on every re-run), so it's guarded by a
+# check for whether the flag is already there.
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+if ! kubectl get deployment metrics-server -n kube-system -o jsonpath='{.spec.template.spec.containers[0].args}' \
+    | grep -q "kubelet-insecure-tls"; then
+  kubectl -n kube-system patch deployment metrics-server --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+fi
+
 # --- ArgoCD ---
 kubectl get namespace argocd || kubectl create namespace argocd
 kubectl apply -n argocd --server-side --force-conflicts \
