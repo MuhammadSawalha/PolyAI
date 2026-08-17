@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       control_plane_ip: ${{ steps.tf-output.outputs.control_plane_ip }}
+      sns_topic_arn: ${{ steps.tf-output.outputs.sns_topic_arn }}
     defaults:
       run:
         working-directory: infra/tf
@@ -106,9 +107,11 @@ jobs:
       - name: Terraform apply
         run: terraform apply -auto-approve -var-file="tfvars/${{ inputs.region }}.tfvars"
 
-      - name: Read control-plane IP
+      - name: Read Terraform outputs
         id: tf-output
-        run: echo "control_plane_ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "control_plane_ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "sns_topic_arn=$(terraform output -raw sns_topic_arn)" >> "$GITHUB_OUTPUT"
 
   bootstrap:
     needs: provision
@@ -168,12 +171,26 @@ jobs:
           target: "/home/ubuntu/cluster-bootstrap/argo"
           strip_components: 3
 
+      - name: Copy monitoring manifests
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/monitoring/*"
+          target: "/home/ubuntu/cluster-bootstrap/monitoring"
+          strip_components: 3
+
       - name: Run bootstrap
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ needs.provision.outputs.control_plane_ip }}
           username: ubuntu
           key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          envs: SNS_TOPIC_ARN
           script: |
+            export SNS_TOPIC_ARN="$SNS_TOPIC_ARN"
             chmod +x /home/ubuntu/cluster-bootstrap/bootstrap.sh
             /home/ubuntu/cluster-bootstrap/bootstrap.sh
+        env:
+          SNS_TOPIC_ARN: ${{ needs.provision.outputs.sns_topic_arn }}

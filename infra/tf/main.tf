@@ -77,3 +77,11 @@ module "ingress" {
   route53_zone_name = var.route53_zone_name
   domain_name       = var.domain_name
 }
+
+module "monitoring" {
+  source = "./modules/monitoring"
+
+  name_prefix      = "sawalha-polyai-${terraform.workspace}"
+  worker_role_name = module.k8s_cluster.worker_role_name
+  alert_email      = var.alert_email
+}

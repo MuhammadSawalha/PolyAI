@@ -1,0 +1,102 @@
+# Helm values for prometheus-community/kube-prometheus-stack - installed once,
+# cluster-wide, into the `monitoring` namespace (unlike the rest of the stack,
+# which is duplicated per dev/prod namespace - see infra/k8s/README.md for why:
+# one Grafana/Prometheus/Alertmanager is "a single place to watch all traffic
+# entering your cluster", per task7.md Part II step 3). ServiceMonitors living
+# in `dev`/`prod` (infra/k8s/{dev,prod}/{agent,yolo}/*-servicemonitor.yaml) are
+# still picked up from here via the namespace-selector: {} settings below.
+#
+# Installed by infra/k8s/bootstrap.sh:
+#   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace \
+#     -f infra/k8s/monitoring/values.yaml \
+#     --set alertmanager.config.receivers[0].sns_configs[0].topic_arn="$SNS_TOPIC_ARN" \
+#     --set alertmanager.config.receivers[0].sns_configs[0].sigv4.region="$SNS_TOPIC_REGION"
+# The SNS topic ARN/region are Terraform outputs (infra/tf/modules/monitoring) -
+# unknowable at commit time, so they're injected via --set instead of hardcoded
+# here (same pattern cluster.yaml already uses for control_plane_ip).
+
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ebs-sc
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 3Gi
+
+    # Pick up ServiceMonitors/PodMonitors/PrometheusRules from every
+    # namespace, not just ones labeled for this Helm release - our own
+    # ServiceMonitors (infra/k8s/{dev,prod}/{agent,yolo}) and PrometheusRule
+    # (infra/k8s/monitoring/prometheus-rules.yaml) carry no such label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    podMonitorSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    ruleSelector: {}
+
+# This is a self-managed kubeadm cluster (infra/tf/modules/k8s-cluster), not
+# EKS - the control-plane component ServiceMonitors this chart enables by
+# default scrape kube-scheduler/kube-controller-manager/kube-proxy/etcd on
+# their kubeadm-default 127.0.0.1-only ports, which are unreachable from
+# Prometheus and would just sit Down forever. Disabled so the target list
+# only shows things that can actually be Up.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+grafana:
+  adminUser: admin
+  adminPassword: admin123 # dev-grade credential, matches the plain-manifest Grafana this replaces - no k8s Secret anywhere in this project (see infra/k8s/README.md Step 3)
+
+  persistence:
+    enabled: true
+    type: pvc
+    storageClassName: ebs-sc
+    accessModes: ["ReadWriteOnce"]
+    size: 1Gi
+
+  # sidecar.dashboards is already enabled cluster-wide by this chart's own
+  # defaults (label: grafana_dashboard, labelValue: "1", searchNamespace: ALL)
+  # - infra/k8s/monitoring/grafana-dashboard-agent.yaml relies on exactly that.
+  # The NGINX Ingress Controller dashboard (task7.md Part II step 3, grafana.com
+  # id 9614) is pulled straight from grafana.com at pod startup instead of a
+  # second hand-copied ConfigMap:
+  dashboards:
+    default:
+      nginx-ingress:
+        gnetId: 9614
+        revision: 1
+        datasource: Prometheus
+
+alertmanager:
+  config:
+    route:
+      receiver: sns-alerts
+      group_by: ["alertname", "severity"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - receiver: sns-alerts
+    receivers:
+      - name: sns-alerts
+        sns_configs:
+          # topic_arn/sigv4.region filled in at install time - see the
+          # helm upgrade --install command in the file header comment above.
+          - topic_arn: ""
+            sigv4:
+              region: ""
+            send_resolved: true

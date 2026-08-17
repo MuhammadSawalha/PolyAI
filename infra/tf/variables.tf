@@ -67,3 +67,8 @@ variable "domain_name" {
   type        = string
   default     = "sawalha-polyai.fursa.click"
 }
+
+variable "alert_email" {
+  description = "Mailbox that receives cluster alert emails from Alertmanager via SNS (task7.md Part II step 4) - set per-region in tfvars/<region>.tfvars, no default since it's personal to whoever's running the cluster"
+  type        = string
+}

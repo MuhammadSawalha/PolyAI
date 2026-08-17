@@ -12,3 +12,8 @@ output "worker_asg_name" {
   description = "Name of the worker Auto Scaling Group"
   value       = aws_autoscaling_group.workers.name
 }
+
+output "worker_role_name" {
+  description = "Name of the worker nodes' IAM role - pods (e.g. Alertmanager) publish to AWS APIs through this role's instance profile, no IRSA"
+  value       = aws_iam_role.worker.name
+}

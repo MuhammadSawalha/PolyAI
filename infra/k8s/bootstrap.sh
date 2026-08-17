@@ -90,6 +90,43 @@ kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
 
 kubectl apply -f "$SCRIPT_DIR/argo/app-of-apps.yaml"
 
+# --- kube-prometheus-stack (Prometheus + Grafana + Alertmanager) ---
+# task7.md Part II. Installed once, cluster-wide, into the `monitoring`
+# namespace via Helm directly (not an ArgoCD Application, same as ArgoCD and
+# ingress-nginx above) - see infra/k8s/monitoring/values.yaml for why this one
+# isn't duplicated per dev/prod like everything else.
+#
+# SNS_TOPIC_ARN is a Terraform output (module.monitoring, infra/tf output
+# sns_topic_arn) - unknowable at commit time, so it's threaded into the
+# Alertmanager SNS receiver via --set instead of being baked into the
+# committed values.yaml. .github/workflows/cluster.yaml exports it
+# automatically before invoking this script; running by hand, export it
+# yourself first: `export SNS_TOPIC_ARN=$(terraform -chdir=infra/tf output -raw sns_topic_arn)`.
+: "${SNS_TOPIC_ARN:?SNS_TOPIC_ARN must be set before running bootstrap.sh - see the comment above this line}"
+SNS_TOPIC_REGION="$(echo "$SNS_TOPIC_ARN" | cut -d: -f4)"
+
+if ! command -v helm >/dev/null 2>&1; then
+  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update prometheus-community
+
+helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace \
+  -f "$SCRIPT_DIR/monitoring/values.yaml" \
+  --set alertmanager.config.receivers[0].sns_configs[0].topic_arn="$SNS_TOPIC_ARN" \
+  --set alertmanager.config.receivers[0].sns_configs[0].sigv4.region="$SNS_TOPIC_REGION" \
+  --wait --timeout 10m
+
+# The ServiceMonitor/PrometheusRule CRDs these depend on only exist once the
+# chart above has installed them, so these must come after, not before.
+kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-dashboard-agent.yaml"
+kubectl apply -f "$SCRIPT_DIR/monitoring/ingress-nginx-metrics.yaml"
+kubectl apply -f "$SCRIPT_DIR/monitoring/prometheus-rules.yaml"
+kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-ingress.yaml"
+kubectl apply -f "$SCRIPT_DIR/monitoring/prometheus-ingress.yaml"
+
 echo "ArgoCD initial admin password:"
 kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 --decode
 echo

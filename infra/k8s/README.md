@@ -1,30 +1,38 @@
 # PolyAI on Kubernetes
 
 Plain-YAML deployment of the PolyAI stack (minus node-exporter) into `dev` and `prod`
-namespaces on a self-managed (kubeadm) cluster. No Helm, no Kustomize, no operators, and
-(per instructor requirement) **no shared "base" folder** - `infra/k8s/` contains only two
-folders, `dev/` and `prod/`, each with its own full, self-contained set of manifests.
-Namespace-scoped bare service DNS names (`agent`, `yolo`, `prometheus`, ...) already
-resolve correctly per-namespace on their own, so the two folders are identical except for
-the frontend Deployment's image tag - even Prometheus's and Grafana's storage is
-dynamically provisioned per-namespace via the same shared `ebs-sc` `StorageClass`, so
-there's no per-environment EBS volume ID to hand-manage anywhere anymore.
+namespaces on a self-managed (kubeadm) cluster. No Kustomize, no shared "base" folder
+(per instructor requirement) - `infra/k8s/dev/` and `infra/k8s/prod/` each have their own
+full, self-contained set of manifests, identical except for the frontend Deployment's image
+tag. Namespace-scoped bare service DNS names (`agent`, `yolo`, ...) already resolve
+correctly per-namespace on their own.
 
 Every Service is still `ClusterIP` - as of task7 (see `task7.md` Part I), the stack is
 additionally reachable from the internet through the Nginx Ingress Controller
 (`infra/k8s/bootstrap.sh`, installed as a fixed-NodePort `Service`) fronted by an ALB +
 Route 53 wildcard record (`infra/tf/modules/ingress`). `kubectl port-forward` still works
 for local debugging and is what Step 8 below documents, but you generally don't need it
-anymore - see "Step 12 - Public access via Ingress" at the bottom of this file.
+anymore - see "Step 14 - Public access via Ingress" at the bottom of this file.
+
+As of task7 Part II, Prometheus and Grafana are no longer hand-written manifests - they're
+`prometheus-community/kube-prometheus-stack` (Helm), installed **once, cluster-wide**, into
+its own `monitoring` namespace, not duplicated per `dev`/`prod` like the rest of the stack
+(see `infra/k8s/monitoring/values.yaml` for why: one Grafana/Prometheus/Alertmanager gives
+"a single place to watch all traffic entering your cluster" across both environments,
+instead of two separate panes of glass). `ServiceMonitor`s living inside `dev`/`prod`
+(`infra/k8s/{dev,prod}/{agent,yolo}/*-servicemonitor.yaml`) are still scraped from there.
 
 The old Docker Compose deployment on the two existing EC2 hosts keeps running unchanged
 throughout - nothing here touches it.
 
 > **Note:** As of the ArgoCD integration, `yolo`, `agent`, `frontend`, and `img-proc-mcp`'s
-> manifests (`infra/k8s/{dev,prod}/<service>/`) are managed by ArgoCD (see
-> `infra/k8s/argo/`), not by manual `kubectl apply`. ArgoCD auto-syncs `dev` on every push
-> to the `dev` branch; `prod` requires a manual sync click in the ArgoCD UI. The steps
-> below still apply as-is to Grafana/Prometheus (the only services still applied manually).
+> manifests (`infra/k8s/{dev,prod}/<service>/`) - including each one's `ServiceMonitor` as
+> of task7 Part II - are managed by ArgoCD (see `infra/k8s/argo/`), not by manual
+> `kubectl apply`. ArgoCD auto-syncs `dev` on every push to the `dev` branch; `prod`
+> requires a manual sync click in the ArgoCD UI. `kube-prometheus-stack` itself and the rest
+> of `infra/k8s/monitoring/` are installed by `infra/k8s/bootstrap.sh` instead (see Step 5) -
+> the steps below still apply as-is to the `Namespace`/`StorageClass` objects still living in
+> `infra/k8s/{dev,prod}/` (the only things still applied manually).
 
 ---
 
@@ -50,21 +58,26 @@ kubeconfig to your laptop and run `kubectl` locally instead, you can skip the SS
 
 ---
 
-## Step 0.5 - Bootstrap Calico + ArgoCD (one-time, after `terraform apply`)
+## Step 0.5 - Bootstrap Calico + ArgoCD + kube-prometheus-stack (one-time, after `terraform apply`)
 
 `infra/tf` provisions the control plane already `kubeadm init`-ed. Installing the
-CNI plugin, ArgoCD, and the `app-of-apps` `Application` (which in turn makes ArgoCD
-pick up every other `Application` in `infra/k8s/argo/` directly from git) is done by
-`infra/k8s/bootstrap.sh` - idempotent, safe to re-run:
+CNI plugin, ArgoCD, the `app-of-apps` `Application` (which in turn makes ArgoCD
+pick up every other `Application` in `infra/k8s/argo/` directly from git), and
+`kube-prometheus-stack` (Prometheus/Grafana/Alertmanager - task7.md Part II) is done by
+`infra/k8s/bootstrap.sh` - idempotent, safe to re-run. It needs `SNS_TOPIC_ARN` (a
+Terraform output, `module.monitoring`) exported first, so Alertmanager knows which SNS
+topic to publish to (see Step 5):
 
 ```bash
 git clone https://github.com/MuhammadSawalha/PolyAI.git
 cd PolyAI
+export SNS_TOPIC_ARN=$(terraform -chdir=infra/tf output -raw sns_topic_arn)
 infra/k8s/bootstrap.sh
 ```
 
 `.github/workflows/cluster.yaml`'s `bootstrap` job runs this same script (copied
-over via `scp` instead of a full clone) - see that workflow for the automated
+over via `scp` instead of a full clone, `SNS_TOPIC_ARN` passed through from the
+`provision` job's Terraform outputs) - see that workflow for the automated
 version of this step.
 
 ## Step 1 - Namespaces
@@ -112,7 +125,7 @@ chain, i.e. this instance profile).
    - `s3-image-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - S3 access for yolo/img-proc-mcp/agent.
    - `sawalha-bedrock-policy` (your existing customer-managed policy, already on the dev/prod EC2 hosts) - Bedrock model invocation for agent.
 3. Install the EBS CSI driver (cluster add-on infrastructure, not one of "your services" -
-   the no-Helm rule is about the app/Prometheus/Grafana Deployments you hand-write):
+   the no-Kustomize/no-shared-base rule is about the app Deployments you hand-write):
    ```bash
    kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.35"
    ```
@@ -141,22 +154,42 @@ docker build --build-arg NEXT_PUBLIC_AGENT_URL=http://localhost:8001 \
 (`services/agent/app.py`'s CORS list already allows `http://localhost:3000` and
 `http://localhost:3001` - see Step 8 for which port maps to which environment.)
 
-## Step 5 - Grafana dashboards ConfigMap
+## Step 5 - kube-prometheus-stack (Prometheus, Grafana, Alertmanager)
 
-Created from files rather than hand-authored YAML, since `fastapi-observability.json` is
-a large pre-existing export:
+Installed by `infra/k8s/bootstrap.sh` (Step 0.5), which runs the equivalent of:
 ```bash
-kubectl create configmap grafana-dashboards -n dev \
-  --from-file=monitoring/grafana/provisioning/dashboards/dashboards.yml \
-  --from-file=monitoring/grafana/provisioning/dashboards/fastapi-observability.json \
-  --from-file=infra/grafana/dashboards/agent.json
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update prometheus-community
 
-kubectl create configmap grafana-dashboards -n prod \
-  --from-file=monitoring/grafana/provisioning/dashboards/dashboards.yml \
-  --from-file=monitoring/grafana/provisioning/dashboards/fastapi-observability.json \
-  --from-file=infra/grafana/dashboards/agent.json
+helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace \
+  -f infra/k8s/monitoring/values.yaml \
+  --set alertmanager.config.receivers[0].sns_configs[0].topic_arn="$SNS_TOPIC_ARN" \
+  --set alertmanager.config.receivers[0].sns_configs[0].sigv4.region="$SNS_TOPIC_REGION"
+
+kubectl apply -f infra/k8s/monitoring/grafana-dashboard-agent.yaml   # sidecar-loaded, no manual import
+kubectl apply -f infra/k8s/monitoring/ingress-nginx-metrics.yaml     # Service + ServiceMonitor for ingress-nginx's own /metrics
+kubectl apply -f infra/k8s/monitoring/prometheus-rules.yaml          # task7.md Part II step 5's two alert rules
+kubectl apply -f infra/k8s/monitoring/grafana-ingress.yaml
+kubectl apply -f infra/k8s/monitoring/prometheus-ingress.yaml
 ```
-(`node-exporter-full.json` is deliberately excluded - node-exporter isn't deployed here.)
+`infra/k8s/monitoring/values.yaml` sets Prometheus storage to `ebs-sc` (3Gi, `retention: 30d`)
+and Grafana persistence to `ebs-sc` (1Gi), and points every Prometheus selector
+(`serviceMonitorNamespaceSelector`, `ruleNamespaceSelector`, ...) at `{}` (all namespaces),
+so it also picks up the `ServiceMonitor`s that live inside `infra/k8s/{dev,prod}/{agent,yolo}/`
+(ArgoCD-managed - each Service now carries `metadata.labels.app` for the `ServiceMonitor`'s
+selector to match, and a named `http` port for its endpoint) and the `PrometheusRule` above.
+`kubeControllerManager`/`kubeScheduler`/`kubeProxy`/`kubeEtcd` are disabled in the values
+file - this is a self-managed kubeadm cluster, not EKS, so those control-plane component
+scrapers would just sit permanently `Down` (their default ports are kubeadm's, bound to
+`127.0.0.1`).
+
+The community [NGINX Ingress Controller dashboard](https://grafana.com/grafana/dashboards/9614-nginx-ingress-controller/)
+(grafana.com id `9614`) is pulled by Grafana itself at pod startup (`grafana.dashboards.default.nginx-ingress.gnetId: 9614`
+in `values.yaml`) - nothing to import by hand. The custom `agent.json` dashboard (same one
+the legacy Docker Compose Grafana uses) is instead committed as a `ConfigMap` labeled
+`grafana_dashboard: "1"`, picked up by the chart's dashboard sidecar
+(`infra/k8s/monitoring/grafana-dashboard-agent.yaml`).
 
 ## Step 6 - Apply everything
 
@@ -169,7 +202,9 @@ kubectl apply -f infra/k8s/prod/
 ```
 No `-n` flag needed - every namespaced object in the folder already declares its own
 `metadata.namespace`, and the `Namespace`/`StorageClass` objects are cluster-scoped so a
-namespace flag wouldn't apply to them anyway.
+namespace flag wouldn't apply to them anyway. As of task7 Part II this only actually applies
+the `Namespace` and `StorageClass` objects - `ebs-sc` still needs to exist here since
+`kube-prometheus-stack`'s Prometheus/Grafana PVCs (Step 5) reference it too.
 
 (Note: this applies everything except `yolo`, `agent`, `frontend`, and `img-proc-mcp`,
 which now live in their own subfolders and are managed by ArgoCD instead - see the note
@@ -185,26 +220,24 @@ kubectl get pods -n prod
 
 Both Prometheus's and Grafana's storage use **dynamic provisioning**:
 `infra/k8s/dev/storageclass.yaml` defines a real `StorageClass` named `ebs-sc`
-(`provisioner: ebs.csi.aws.com`), and `prometheus-pvc.yaml`/`grafana-pvc.yaml` just ask
-for `storageClassName: ebs-sc` - no EBS volume or PV is created ahead of time, and no
-`volumeHandle`/`claimRef` to fill in by hand anywhere. Because `ebs-sc` uses
-`volumeBindingMode: WaitForFirstConsumer`, each PVC stays `Pending` until a Pod that
-mounts it is actually scheduled onto a node - only then does the EBS CSI driver create the
-volume, in that node's exact Availability Zone.
+(`provisioner: ebs.csi.aws.com`), and `kube-prometheus-stack`'s Prometheus/Grafana just ask
+for `storageClassName: ebs-sc` (`infra/k8s/monitoring/values.yaml`) - no EBS volume or PV is
+created ahead of time, and no `volumeHandle`/`claimRef` to fill in by hand anywhere. Because
+`ebs-sc` uses `volumeBindingMode: WaitForFirstConsumer`, each PVC stays `Pending` until a Pod
+that mounts it is actually scheduled onto a node - only then does the EBS CSI driver create
+the volume, in that node's exact Availability Zone.
 
-Watch it happen (all four PVCs were already created by Step 6's bulk apply):
+Watch it happen (both PVCs were already created by Step 5's Helm install):
 ```bash
-kubectl get pvc -n dev -w
+kubectl get pvc -n monitoring -w
 ```
-You should see `prometheus-pvc` and `grafana-pvc` both go `Pending` → `Bound` within a few
+You should see the Prometheus and Grafana PVCs both go `Pending` → `Bound` within a few
 seconds, once their respective pods schedule. Then:
 ```bash
-kubectl get pv                                  # two new PVs were auto-created - no *-pv.yaml exists anywhere in the repo
-kubectl describe pvc prometheus-pvc -n dev       # shows the auto-created EBS volume ID
-kubectl describe pvc grafana-pvc -n dev          # same, for grafana's own volume
+kubectl get pv                                             # two new PVs were auto-created
+kubectl describe pvc -n monitoring -l app.kubernetes.io/name=grafana
+kubectl get pvc -n monitoring -l operator.prometheus.io/name=kube-prometheus-stack-prometheus
 ```
-Repeat with `-n prod` to see prod's own PVCs go through the same thing independently
-(separate EBS volumes - each namespace's PVCs provision their own).
 
 ## Step 8 - Access it via port-forward
 
@@ -215,8 +248,15 @@ clashing. Suggested mapping (matches the URLs baked into the frontend images in 
 |---|---|---|
 | frontend | `kubectl port-forward svc/frontend-svc 3000:3000 -n dev` | `kubectl port-forward svc/frontend-svc 3001:3000 -n prod` |
 | agent | `kubectl port-forward svc/agent-svc 8000:8000 -n dev` | `kubectl port-forward svc/agent-svc 8001:8000 -n prod` |
-| grafana | `kubectl port-forward svc/grafana-svc 3002:3000 -n dev` | `kubectl port-forward svc/grafana-svc 3003:3000 -n prod` |
-| prometheus | `kubectl port-forward svc/prometheus-svc 9090:9090 -n dev` | `kubectl port-forward svc/prometheus-svc 9091:9090 -n prod` |
+
+Grafana/Prometheus/Alertmanager are a single, cluster-wide install (`monitoring` namespace,
+Step 5) rather than one per environment:
+
+```bash
+kubectl port-forward svc/kube-prometheus-stack-grafana 3002:80 -n monitoring
+kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring
+kubectl port-forward svc/kube-prometheus-stack-alertmanager 9093:9093 -n monitoring
+```
 
 Each `kubectl port-forward` command blocks in its own terminal (or run with `&`/`nohup` to
 background it). With frontend+agent forwarded for dev, open `http://localhost:3000` and
@@ -251,9 +291,9 @@ verify prod's HPA too.
 ## Step 10 - Verify Prometheus storage actually persists
 
 ```bash
-kubectl delete pod -n dev -l app=prometheus
-kubectl get pods -n dev -w   # wait for the replacement pod to become Ready
-kubectl port-forward svc/prometheus-svc 9090:9090 -n dev
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=prometheus
+kubectl get pods -n monitoring -w   # wait for the replacement pod to become Ready
+kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring
 ```
 Open `http://localhost:9090/graph` and confirm historical metrics from before the delete
 are still there (proves the PVC/EBS volume, not the pod's local disk, is where the data
@@ -278,7 +318,84 @@ kubectl get nodes                      # find the NotReady one(s)
 kubectl delete node <node-name>
 ```
 
-## Step 12 - Public access via Ingress
+## Step 12 - Verify ServiceMonitor targets and dashboards (task7.md Part II step 3)
+
+Open the Prometheus UI (`kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090
+-n monitoring`, then `http://localhost:9090/targets`) and confirm these are all `UP`:
+- `serviceMonitor/dev/agent/0` and `serviceMonitor/prod/agent/0`
+- `serviceMonitor/dev/yolo/0` and `serviceMonitor/prod/yolo/0`
+- `serviceMonitor/monitoring/ingress-nginx-controller/0`
+
+If any of these are missing entirely (not just `Down`), the `ServiceMonitor` hasn't been
+picked up yet - check `kubectl get servicemonitors -A` and that ArgoCD synced
+`infra/k8s/{dev,prod}/{agent,yolo}/*-servicemonitor.yaml` (`kubectl get application -n argocd`).
+
+Then open Grafana (`kubectl port-forward svc/kube-prometheus-stack-grafana 3002:80
+-n monitoring`, `http://localhost:3002`, `admin`/`admin123` - see `infra/k8s/monitoring/values.yaml`)
+and confirm both dashboards loaded automatically (Dashboards → Browse, no manual import step
+for either):
+- **Agent Observability** - chat request rate/latency/error-rate/token usage, sourced from
+  `agent_chat_requests_total`/`agent_chat_latency_seconds` (`services/agent/app.py`).
+- **NGINX Ingress Controller** - request rate, latency, and response codes per `Ingress`
+  host, sourced from `ingress-nginx-controller-metrics` - "a single place to watch all
+  traffic entering your cluster" across both `dev` and `prod`.
+
+## Step 13 - Alerting: SNS → email, and simulating a failure (task7.md Part II steps 4-6)
+
+**One-time:** the first `terraform apply` after adding `alert_email` to your tfvars sends
+that address an SNS subscription-confirmation email - click the link, or Alertmanager's
+`sns_configs` publishes will succeed but nothing will ever arrive in your inbox.
+
+`infra/k8s/monitoring/prometheus-rules.yaml` defines two rules against real agent/yolo
+metrics, at different severities:
+- `AgentHighChatErrorRate` (`critical`) - fires when >20% of the agent's `/chat` requests
+  fail over 5 minutes (`agent_chat_requests_total{status="error"}` vs the total).
+- `YoloHighPredictLatency` (`warning`) - fires when yolo's `/predict` p95 latency exceeds 2s
+  for 5 minutes (`http_request_duration_seconds_bucket{job="yolo",handler="/predict"}`).
+
+To prove the whole chain (`Pending` → `Firing` in Prometheus → Alertmanager → email, then
+`RESOLVED`), the easiest one to trigger deliberately is `AgentHighChatErrorRate` - and it
+needs the agent pod to keep *running* (so `/metrics` stays scrapeable and `_chat_impl`'s
+`except Exception: CHAT_REQUESTS.labels(status="error").inc()` in `services/agent/app.py`
+actually executes), not scaled to 0. Point it at a Bedrock model that doesn't exist instead,
+so every `/chat` call reaches `_chat_impl`, fails inside it, and increments the `error`
+counter for real:
+
+```bash
+kubectl patch configmap agent-config -n dev --type merge -p '{"data":{"MODEL":"does-not-exist"}}'
+kubectl rollout restart deployment/agent -n dev   # ConfigMap changes aren't hot-reloaded
+kubectl rollout status deployment/agent -n dev
+
+# generate a handful of failing /chat requests, spread over a minute or two so rate() has
+# enough samples to average over
+kubectl port-forward svc/agent-svc 8000:8000 -n dev &
+for i in $(seq 1 10); do
+  curl -s -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"hi"}]}'
+  sleep 10
+done
+```
+
+Watch it progress:
+1. Prometheus UI → Alerts: `AgentHighChatErrorRate` goes `Inactive` → `Pending` (once the
+   error ratio crosses 20%) → `Firing` (after the 5m `for:` window).
+2. Alertmanager UI (`kubectl port-forward svc/kube-prometheus-stack-alertmanager 9093:9093
+   -n monitoring`, `http://localhost:9093`): the alert shows up there once Prometheus fires it.
+3. Your inbox: an SNS email notification arrives shortly after (`sns_configs` fan-out).
+
+Then fix the cause and confirm the `RESOLVED` notification also arrives:
+```bash
+kubectl patch configmap agent-config -n dev --type merge -p '{"data":{"MODEL":"amazon.nova-lite-v1:0"}}'
+kubectl rollout restart deployment/agent -n dev
+kubectl rollout status deployment/agent -n dev
+```
+Once the error ratio drops back under 20% and stays there past `repeat_interval`, Prometheus
+transitions the alert back to `Inactive` and Alertmanager sends a second, `RESOLVED` email
+for the same alert. (`infra/k8s/dev/agent/agent-configmap.yaml` was never edited in git, so
+ArgoCD's `selfHeal` would have reverted the live patch back to `amazon.nova-lite-v1:0` on its
+own anyway.)
+
+## Step 14 - Public access via Ingress
 
 `infra/k8s/bootstrap.sh` installs the Nginx Ingress Controller (baremetal provider
 manifest) and pins its Service's `nodePort`s to `30080` (HTTP) / `30443` (HTTPS) -
@@ -291,18 +408,21 @@ know about individual services at all.
 
 Once `terraform apply` and `bootstrap.sh` have both run, and ArgoCD has synced the
 `*-ingress.yaml` manifests (`infra/k8s/{dev,prod}/{frontend,agent}/*-ingress.yaml`,
-applied automatically by ArgoCD; `infra/k8s/{dev,prod}/grafana-ingress.yaml` and
-`prometheus-ingress.yaml`, applied manually as part of Step 6; `infra/k8s/argo/argocd-ingress.yaml`,
-picked up by the `app-of-apps` `Application` itself), everything is reachable directly
-over HTTPS, no port-forward or SSH tunnel needed:
+applied automatically by ArgoCD; `infra/k8s/argo/argocd-ingress.yaml`, picked up by the
+`app-of-apps` `Application` itself; `infra/k8s/monitoring/{grafana,prometheus}-ingress.yaml`,
+applied by `bootstrap.sh` as part of Step 5), everything is reachable directly over HTTPS,
+no port-forward or SSH tunnel needed:
 
 | | dev | prod |
 |---|---|---|
 | frontend | `https://frontend-dev.sawalha-polyai.fursa.click` | `https://frontend-prod.sawalha-polyai.fursa.click` |
 | agent | `https://agent-dev.sawalha-polyai.fursa.click` | `https://agent-prod.sawalha-polyai.fursa.click` |
-| grafana | `https://grafana-dev.sawalha-polyai.fursa.click` | `https://grafana-prod.sawalha-polyai.fursa.click` |
-| prometheus | `https://prometheus-dev.sawalha-polyai.fursa.click` | `https://prometheus-prod.sawalha-polyai.fursa.click` |
-| argocd | `https://argocd.sawalha-polyai.fursa.click` (single, cluster-wide) | |
+
+| | single, cluster-wide |
+|---|---|
+| grafana | `https://grafana.sawalha-polyai.fursa.click` |
+| prometheus | `https://prometheus.sawalha-polyai.fursa.click` |
+| argocd | `https://argocd.sawalha-polyai.fursa.click` |
 
 DNS propagation plus ACM's DNS validation can take a few minutes after the first
 `terraform apply` - `terraform output alb_dns_name` and a direct `curl -H "Host: ..."
