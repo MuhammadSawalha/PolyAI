@@ -275,6 +275,21 @@ resource "aws_autoscaling_group" "workers" {
     propagate_at_launch = true
   }
 
+  # Cluster Autoscaler's AWS auto-discovery (task7.md Part III bonus) finds
+  # this ASG by these two tags instead of a hardcoded --nodes flag - see
+  # infra/k8s/autoscaler/values.yaml's autoDiscovery.clusterName.
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/enabled"
+    value               = "true"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/${var.name_prefix}"
+    value               = "owned"
+    propagate_at_launch = true
+  }
+
   lifecycle {
     create_before_destroy = true
   }

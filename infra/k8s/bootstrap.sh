@@ -127,6 +127,34 @@ kubectl apply -f "$SCRIPT_DIR/monitoring/prometheus-rules.yaml"
 kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-ingress.yaml"
 kubectl apply -f "$SCRIPT_DIR/monitoring/prometheus-ingress.yaml"
 
+# --- Cluster Autoscaler (task7.md Part III bonus) ---
+# Installed the same way as kube-prometheus-stack: Helm directly, into
+# kube-system, not an ArgoCD Application. No IRSA (not EKS) - it
+# authenticates through the worker node's own EC2 instance profile
+# (infra/tf/modules/autoscaler), same pattern as Alertmanager's SNS publish.
+#
+# CLUSTER_NAME/AWS_REGION are Terraform outputs (module.autoscaler's
+# discovery tags live on the worker ASG; infra/tf output cluster_name) -
+# unknowable at commit time, so they're threaded into the Helm install via
+# --set instead of being baked into the committed values.yaml, same as
+# SNS_TOPIC_ARN above. .github/workflows/cluster.yaml exports both
+# automatically before invoking this script; running by hand, export them
+# yourself first:
+#   export CLUSTER_NAME=$(terraform -chdir=infra/tf output -raw cluster_name)
+#   export AWS_REGION=<the region you provisioned the cluster into>
+: "${CLUSTER_NAME:?CLUSTER_NAME must be set before running bootstrap.sh - see the comment above this line}"
+: "${AWS_REGION:?AWS_REGION must be set before running bootstrap.sh - see the comment above this line}"
+
+helm repo add autoscaler https://kubernetes.github.io/autoscaler
+helm repo update autoscaler
+
+helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+  -n kube-system \
+  -f "$SCRIPT_DIR/autoscaler/values.yaml" \
+  --set autoDiscovery.clusterName="$CLUSTER_NAME" \
+  --set awsRegion="$AWS_REGION" \
+  --wait --timeout 5m
+
 echo "ArgoCD initial admin password:"
 kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 --decode
 echo

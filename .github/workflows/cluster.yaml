@@ -27,6 +27,7 @@ jobs:
     outputs:
       control_plane_ip: ${{ steps.tf-output.outputs.control_plane_ip }}
       sns_topic_arn: ${{ steps.tf-output.outputs.sns_topic_arn }}
+      cluster_name: ${{ steps.tf-output.outputs.cluster_name }}
     defaults:
       run:
         working-directory: infra/tf
@@ -112,6 +113,7 @@ jobs:
         run: |
           echo "control_plane_ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
           echo "sns_topic_arn=$(terraform output -raw sns_topic_arn)" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
 
   bootstrap:
     needs: provision
@@ -181,16 +183,30 @@ jobs:
           target: "/home/ubuntu/cluster-bootstrap/monitoring"
           strip_components: 3
 
+      - name: Copy autoscaler manifests
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/autoscaler/*"
+          target: "/home/ubuntu/cluster-bootstrap/autoscaler"
+          strip_components: 3
+
       - name: Run bootstrap
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ needs.provision.outputs.control_plane_ip }}
           username: ubuntu
           key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
-          envs: SNS_TOPIC_ARN
+          envs: SNS_TOPIC_ARN,CLUSTER_NAME,AWS_REGION
           script: |
             export SNS_TOPIC_ARN="$SNS_TOPIC_ARN"
+            export CLUSTER_NAME="$CLUSTER_NAME"
+            export AWS_REGION="$AWS_REGION"
             chmod +x /home/ubuntu/cluster-bootstrap/bootstrap.sh
             /home/ubuntu/cluster-bootstrap/bootstrap.sh
         env:
           SNS_TOPIC_ARN: ${{ needs.provision.outputs.sns_topic_arn }}
+          CLUSTER_NAME: ${{ needs.provision.outputs.cluster_name }}
+          AWS_REGION: ${{ inputs.region }}

@@ -85,3 +85,11 @@ module "monitoring" {
   worker_role_name = module.k8s_cluster.worker_role_name
   alert_email      = var.alert_email
 }
+
+module "autoscaler" {
+  source = "./modules/autoscaler"
+
+  name_prefix      = "sawalha-polyai-${terraform.workspace}"
+  worker_role_name = module.k8s_cluster.worker_role_name
+  worker_asg_arn   = module.k8s_cluster.worker_asg_arn
+}

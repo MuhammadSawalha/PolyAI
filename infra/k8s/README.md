@@ -62,23 +62,27 @@ kubeconfig to your laptop and run `kubectl` locally instead, you can skip the SS
 
 `infra/tf` provisions the control plane already `kubeadm init`-ed. Installing the
 CNI plugin, ArgoCD, the `app-of-apps` `Application` (which in turn makes ArgoCD
-pick up every other `Application` in `infra/k8s/argo/` directly from git), and
-`kube-prometheus-stack` (Prometheus/Grafana/Alertmanager - task7.md Part II) is done by
-`infra/k8s/bootstrap.sh` - idempotent, safe to re-run. It needs `SNS_TOPIC_ARN` (a
-Terraform output, `module.monitoring`) exported first, so Alertmanager knows which SNS
-topic to publish to (see Step 5):
+pick up every other `Application` in `infra/k8s/argo/` directly from git),
+`kube-prometheus-stack` (Prometheus/Grafana/Alertmanager - task7.md Part II), and
+Cluster Autoscaler (task7.md Part III bonus) is done by `infra/k8s/bootstrap.sh` -
+idempotent, safe to re-run. It needs `SNS_TOPIC_ARN` (a Terraform output,
+`module.monitoring`) exported first, so Alertmanager knows which SNS topic to publish
+to (see Step 5), and `CLUSTER_NAME`/`AWS_REGION` so Cluster Autoscaler knows which
+worker ASG to discover and manage (see Step 15):
 
 ```bash
 git clone https://github.com/MuhammadSawalha/PolyAI.git
 cd PolyAI
 export SNS_TOPIC_ARN=$(terraform -chdir=infra/tf output -raw sns_topic_arn)
+export CLUSTER_NAME=$(terraform -chdir=infra/tf output -raw cluster_name)
+export AWS_REGION=us-east-1   # match the region you provisioned the cluster into
 infra/k8s/bootstrap.sh
 ```
 
 `.github/workflows/cluster.yaml`'s `bootstrap` job runs this same script (copied
-over via `scp` instead of a full clone, `SNS_TOPIC_ARN` passed through from the
-`provision` job's Terraform outputs) - see that workflow for the automated
-version of this step.
+over via `scp` instead of a full clone, `SNS_TOPIC_ARN`/`CLUSTER_NAME` passed through
+from the `provision` job's Terraform outputs and `AWS_REGION` from the workflow's
+`region` input) - see that workflow for the automated version of this step.
 
 ## Step 1 - Namespaces
 
@@ -428,3 +432,55 @@ DNS propagation plus ACM's DNS validation can take a few minutes after the first
 `terraform apply` - `terraform output alb_dns_name` and a direct `curl -H "Host: ..."
 http://<alb_dns_name>` (matching one of the hosts above) is a faster way to confirm the
 ALB → target group → ingress-nginx path works before waiting on DNS.
+
+## Step 15 - Cluster Autoscaler (task7.md Part III bonus)
+
+`infra/k8s/bootstrap.sh` installs `autoscaler/cluster-autoscaler` (Helm) into
+`kube-system`, once, cluster-wide - it watches for `Pending` Pods that don't fit on any
+current node and grows `module.k8s_cluster.aws_autoscaling_group.workers`'s
+`desired_capacity` (bounded by `asg_min_size`/`asg_max_size`), then shrinks it back down
+once nodes sit underutilized for `scale-down-unneeded-time` (`infra/k8s/autoscaler/values.yaml`,
+10m). It authenticates through the worker node's own EC2 instance profile - no IRSA, same
+pattern as Alertmanager's SNS publish (Step 3) - via the IAM policy in
+`infra/tf/modules/autoscaler`, scoped to just this cluster's one ASG
+(`autoscaling:SetDesiredCapacity`/`TerminateInstanceInAutoScalingGroup` require the exact
+ASG ARN; the read-only `Describe*` calls need `Resource: "*"`, an IAM API limitation, not a
+missed scope). It finds that ASG via AWS auto-discovery - the
+`k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster_name>=owned`
+tags Terraform puts on it (`infra/tf/modules/k8s-cluster`) - instead of a hardcoded
+`--nodes=min:max:asg-name`, so `asg_min_size`/`asg_max_size` stay the single source of
+truth.
+
+**Prove scale-up:** `infra/k8s/autoscaler/scale-up-demo.yaml` is a 3-replica dummy
+Deployment (`registry.k8s.io/pause`) that each requests more memory (2500Mi) than
+comfortably fits alongside the others on the current worker fleet - deliberately not part
+of `app-of-apps`, apply/delete it by hand:
+
+```bash
+kubectl apply -f infra/k8s/autoscaler/scale-up-demo.yaml
+kubectl get pods -n dev -w                       # some stay Pending on the current node(s)
+kubectl -n kube-system logs -l app.kubernetes.io/name=aws-cluster-autoscaler -f   # watch it decide to scale up
+```
+
+Within a minute or two you should see a new EC2 instance launch (`aws autoscaling
+describe-auto-scaling-groups --auto-scaling-group-name <name>` or the EC2 console/
+`kubectl get nodes -w`), join the cluster, and the previously-`Pending` Pods schedule onto
+it.
+
+**Prove scale-down:**
+
+```bash
+kubectl delete -f infra/k8s/autoscaler/scale-up-demo.yaml
+```
+
+Once the extra node(s) sit idle past `scale-down-unneeded-time` (10m), the autoscaler
+drains and terminates them and the ASG's `desired_capacity` drops back down -
+`kubectl get nodes -w` and the ASG's `DesiredCapacity` both confirm it. Unlike Step 11's
+manual `tfvars` scale-down, the autoscaler's own termination path cleans up the matching
+`Node` object itself (it calls the Kubernetes API as part of the scale-down, not just the
+ASG API) - no leftover `NotReady` node to `kubectl delete` by hand.
+
+> [!IMPORTANT]
+> Set `asg_desired_capacity` back to `0` in `infra/tf/tfvars/<region>.tfvars` (and
+> re-apply/re-run `cluster.yaml`) once you're done experimenting, to avoid paying for idle
+> workers.

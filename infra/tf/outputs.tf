@@ -27,3 +27,8 @@ output "sns_topic_arn" {
   description = "ARN of the SNS topic Alertmanager publishes alerts to - fed into the kube-prometheus-stack Helm install as --set overrides (infra/k8s/bootstrap.sh)"
   value       = module.monitoring.sns_topic_arn
 }
+
+output "cluster_name" {
+  description = "Cluster name derived from terraform.workspace - unknowable at commit time, so it's fed into the Cluster Autoscaler Helm install as --set autoDiscovery.clusterName (infra/k8s/bootstrap.sh), matching the k8s.io/cluster-autoscaler/<cluster_name> tag on the worker ASG (infra/tf/modules/k8s-cluster)"
+  value       = "sawalha-polyai-${terraform.workspace}"
+}
