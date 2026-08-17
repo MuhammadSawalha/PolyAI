@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-ingress
+  namespace: argocd
+  annotations:
+    # argocd-server multiplexes grpc/https on a single port and issues a
+    # redirect for plain HTTP requests to it - pointing the ingress at its
+    # "https" Service port with this annotation avoids that redirect loop
+    # without needing to restart argocd-server with --insecure.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: argocd.sawalha-polyai.fursa.click
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 443

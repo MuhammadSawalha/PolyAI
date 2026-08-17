@@ -49,3 +49,21 @@ variable "kubernetes_version" {
   type        = string
   default     = "1.30"
 }
+
+variable "ingress_http_node_port" {
+  description = "Fixed NodePort the ingress-nginx controller exposes HTTP on - must match the value infra/k8s/bootstrap.sh patches the Service to"
+  type        = number
+  default     = 30080
+}
+
+variable "route53_zone_name" {
+  description = "Name of the pre-existing, shared Route 53 hosted zone to add DNS records into"
+  type        = string
+  default     = "fursa.click"
+}
+
+variable "domain_name" {
+  description = "Base domain under route53_zone_name; Ingress hosts and the ACM cert live under *.<domain_name>"
+  type        = string
+  default     = "sawalha-polyai.fursa.click"
+}

@@ -12,3 +12,13 @@ output "worker_asg_name" {
   description = "Name of the worker Auto Scaling Group"
   value       = module.k8s_cluster.worker_asg_name
 }
+
+output "alb_dns_name" {
+  description = "DNS name of the ALB fronting the cluster"
+  value       = module.ingress.alb_dns_name
+}
+
+output "domain_name" {
+  description = "Base domain Ingress hosts live under (*.<domain_name>)"
+  value       = module.ingress.domain_name
+}

@@ -10,9 +10,12 @@ the frontend Deployment's image tag - even Prometheus's and Grafana's storage is
 dynamically provisioned per-namespace via the same shared `ebs-sc` `StorageClass`, so
 there's no per-environment EBS volume ID to hand-manage anywhere anymore.
 
-**No NodePort/Ingress anywhere** (per instructor requirement) - every Service is
-`ClusterIP`, and every access path (browser to frontend/agent, you to Grafana/Prometheus)
-goes through a manually-run `kubectl port-forward`.
+Every Service is still `ClusterIP` - as of task7 (see `task7.md` Part I), the stack is
+additionally reachable from the internet through the Nginx Ingress Controller
+(`infra/k8s/bootstrap.sh`, installed as a fixed-NodePort `Service`) fronted by an ALB +
+Route 53 wildcard record (`infra/tf/modules/ingress`). `kubectl port-forward` still works
+for local debugging and is what Step 8 below documents, but you generally don't need it
+anymore - see "Step 12 - Public access via Ingress" at the bottom of this file.
 
 The old Docker Compose deployment on the two existing EC2 hosts keeps running unchanged
 throughout - nothing here touches it.
@@ -274,3 +277,34 @@ stale node(s) by hand:
 kubectl get nodes                      # find the NotReady one(s)
 kubectl delete node <node-name>
 ```
+
+## Step 12 - Public access via Ingress
+
+`infra/k8s/bootstrap.sh` installs the Nginx Ingress Controller (baremetal provider
+manifest) and pins its Service's `nodePort`s to `30080` (HTTP) / `30443` (HTTPS) -
+`infra/tf/modules/ingress` provisions an ALB whose target group points at `30080` on
+every worker (via `aws_autoscaling_attachment`, so it stays correct as the ASG scales),
+terminates TLS with an ACM certificate for `*.sawalha-polyai.fursa.click`, and a Route 53
+alias record for that same wildcard in the shared `fursa.click` zone. Routing to the right
+Service happens inside the ingress controller by `Host` header - the ALB/DNS layer don't
+know about individual services at all.
+
+Once `terraform apply` and `bootstrap.sh` have both run, and ArgoCD has synced the
+`*-ingress.yaml` manifests (`infra/k8s/{dev,prod}/{frontend,agent}/*-ingress.yaml`,
+applied automatically by ArgoCD; `infra/k8s/{dev,prod}/grafana-ingress.yaml` and
+`prometheus-ingress.yaml`, applied manually as part of Step 6; `infra/k8s/argo/argocd-ingress.yaml`,
+picked up by the `app-of-apps` `Application` itself), everything is reachable directly
+over HTTPS, no port-forward or SSH tunnel needed:
+
+| | dev | prod |
+|---|---|---|
+| frontend | `https://frontend-dev.sawalha-polyai.fursa.click` | `https://frontend-prod.sawalha-polyai.fursa.click` |
+| agent | `https://agent-dev.sawalha-polyai.fursa.click` | `https://agent-prod.sawalha-polyai.fursa.click` |
+| grafana | `https://grafana-dev.sawalha-polyai.fursa.click` | `https://grafana-prod.sawalha-polyai.fursa.click` |
+| prometheus | `https://prometheus-dev.sawalha-polyai.fursa.click` | `https://prometheus-prod.sawalha-polyai.fursa.click` |
+| argocd | `https://argocd.sawalha-polyai.fursa.click` (single, cluster-wide) | |
+
+DNS propagation plus ACM's DNS validation can take a few minutes after the first
+`terraform apply` - `terraform output alb_dns_name` and a direct `curl -H "Host: ..."
+http://<alb_dns_name>` (matching one of the hosts above) is a faster way to confirm the
+ALB → target group → ingress-nginx path works before waiting on DNS.

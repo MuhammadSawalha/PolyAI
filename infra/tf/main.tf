@@ -64,3 +64,16 @@ module "k8s_cluster" {
 
   kubernetes_version = var.kubernetes_version
 }
+
+module "ingress" {
+  source = "./modules/ingress"
+
+  name_prefix       = "sawalha-polyai-${terraform.workspace}"
+  vpc_id            = module.vpc.vpc_id
+  public_subnet_ids = module.vpc.public_subnets
+  worker_asg_name   = module.k8s_cluster.worker_asg_name
+
+  http_node_port    = var.ingress_http_node_port
+  route53_zone_name = var.route53_zone_name
+  domain_name       = var.domain_name
+}

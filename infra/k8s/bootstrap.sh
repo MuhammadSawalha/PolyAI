@@ -61,6 +61,20 @@ if ! kubectl get deployment metrics-server -n kube-system -o jsonpath='{.spec.te
     -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 fi
 
+# --- Nginx Ingress Controller ---
+# baremetal provider manifest -> the Service comes up as NodePort (no cloud
+# LB controller here to provision one for us). The nodePorts it's assigned
+# start out random; pin them to the fixed values infra/tf's ALB target group
+# is built to point at (var.ingress_http_node_port, currently 30080) so the
+# target group doesn't need to be re-pointed by hand after every install.
+# `kubectl patch` without --type defaults to a strategic merge, which for
+# Service.spec.ports merges list entries by their "port" key - safe to re-run
+# regardless of the two ports' order in the upstream manifest.
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.3/deploy/static/provider/baremetal/deploy.yaml
+kubectl -n ingress-nginx patch svc ingress-nginx-controller -p \
+  '{"spec":{"ports":[{"port":80,"nodePort":30080},{"port":443,"nodePort":30443}]}}'
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
+
 # --- ArgoCD ---
 kubectl get namespace argocd || kubectl create namespace argocd
 kubectl apply -n argocd --server-side --force-conflicts \
