@@ -74,16 +74,15 @@ jobs:
             echo "::group::$SERVICE"
 
             # frontend bakes NEXT_PUBLIC_AGENT_URL into the browser bundle at
-            # build time; there's no Ingress in the cluster, so it points at
-            # the port the agent is port-forwarded to for that environment
-            # (see infra/k8s/README.md Step 4: localhost:8000 for dev,
-            # localhost:8001 for prod).
+            # build time; it must point at the public Ingress host for the
+            # agent in that environment (infra/k8s/{dev,prod}/agent/agent-ingress.yaml)
+            # since the browser calling it runs outside the cluster.
             BUILD_ARG=""
             if [ "$SERVICE" = "frontend" ]; then
               if [ "$ENVIRONMENT" = "prod" ]; then
-                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=http://localhost:8001"
+                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=https://agent-prod.sawalha-polyai.fursa.click"
               else
-                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=http://localhost:8000"
+                BUILD_ARG="NEXT_PUBLIC_AGENT_URL=https://agent-dev.sawalha-polyai.fursa.click"
               fi
             fi
 

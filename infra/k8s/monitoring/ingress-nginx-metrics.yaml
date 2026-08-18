@@ -1,0 +1,45 @@
+# The ingress-nginx-controller (installed by infra/k8s/bootstrap.sh from the
+# upstream baremetal provider manifest, not Helm) already exposes Prometheus
+# metrics on containerPort 10254 by default - nothing to turn on in the
+# controller itself. What's missing is a Service fronting that port (the
+# baremetal manifest's own Service only exposes the NodePort http/https ports)
+# and a ServiceMonitor so kube-prometheus-stack's Prometheus scrapes it - see
+# https://kubernetes.github.io/ingress-nginx/user-guide/monitoring/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller-metrics
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - name: metrics
+      port: 10254
+      targetPort: 10254
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingress-nginx-controller
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - ingress-nginx
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/instance: ingress-nginx
+      app.kubernetes.io/component: controller
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics

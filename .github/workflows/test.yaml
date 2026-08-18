@@ -102,3 +102,4 @@ jobs:
           image: local://${{ matrix.tag }}
           only-severities: critical,high,medium
           exit-code: false
+          write-comment: false

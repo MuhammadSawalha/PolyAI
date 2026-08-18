@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-ingress
+  namespace: dev
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: agent-dev.sawalha-polyai.fursa.click
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-svc
+                port:
+                  number: 8000
