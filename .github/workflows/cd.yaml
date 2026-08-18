@@ -33,6 +33,11 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
+          # Default GITHUB_TOKEN can't push straight to a ruleset-protected
+          # main, and PRs/pushes it makes don't trigger other workflows
+          # anyway - so required status checks would never run on them.
+          # A PAT makes the automation act as a real user instead.
+          token: ${{ secrets.GH_PAT }}
 
       - uses: dorny/paths-filter@v3
         id: filter
@@ -105,6 +110,7 @@ jobs:
         if: steps.filter.outputs.changes != '[]'
         env:
           ENVIRONMENT: ${{ steps.env.outputs.name }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -117,5 +123,22 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore(cd): deploy ${{ github.sha }} to ${ENVIRONMENT} [skip ci]"
-          git push origin "HEAD:${{ github.ref_name }}"
+          # dev has no branch protection - deploy by pushing straight to it,
+          # same as before. main requires a PR (see the ruleset "Protect Main
+          # Branch"), so for prod we commit to a side branch and open a PR
+          # instead - ArgoCD's prod apps are synced manually anyway, so
+          # merging this PR is just the first of two deliberate approval steps.
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            BRANCH="cd/deploy-prod-${{ github.sha }}"
+            git checkout -b "$BRANCH"
+            git commit -m "chore(cd): deploy ${{ github.sha }} to prod"
+            git push origin "$BRANCH"
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(cd): deploy ${{ github.sha }} to prod" \
+              --body "Automated image tag bump built from ${{ github.sha }}. Merge to promote - ArgoCD's prod apps still need a manual sync after merge."
+          else
+            git commit -m "chore(cd): deploy ${{ github.sha }} to ${ENVIRONMENT} [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
