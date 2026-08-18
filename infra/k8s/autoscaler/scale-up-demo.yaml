@@ -1,0 +1,30 @@
+# Oversized dummy workload for manually demoing the Cluster Autoscaler
+# (task7.md Part III bonus, infra/k8s/README.md Step 15) - NOT part of
+# app-of-apps/ArgoCD, apply and delete this by hand.
+#
+# Each replica requests more memory than comfortably fits alongside the
+# others on this cluster's worker fleet (t3.medium, ~3.4Gi allocatable), so
+# with the default asg_desired_capacity=1 most replicas stay Pending until
+# the autoscaler grows the ASG (bounded by asg_max_size) and new nodes join.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaler-demo
+  namespace: dev
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: autoscaler-demo
+  template:
+    metadata:
+      labels:
+        app: autoscaler-demo
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2500Mi

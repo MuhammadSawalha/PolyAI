@@ -1,0 +1,41 @@
+# Helm values for autoscaler/cluster-autoscaler (task7.md Part III bonus).
+# Installed once, cluster-wide, into kube-system - not duplicated per
+# dev/prod (there's only one worker ASG for the whole cluster to scale).
+#
+# Installed by infra/k8s/bootstrap.sh:
+#   helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+#     -n kube-system \
+#     -f infra/k8s/autoscaler/values.yaml \
+#     --set autoDiscovery.clusterName="$CLUSTER_NAME" \
+#     --set awsRegion="$AWS_REGION"
+# clusterName/awsRegion are Terraform outputs (infra/tf output cluster_name;
+# awsRegion is just the region the cluster was provisioned into) - unknowable
+# at commit time, so they're injected via --set instead of hardcoded here
+# (same pattern infra/k8s/monitoring/values.yaml uses for the SNS topic ARN).
+#
+# No IRSA - this isn't EKS. The pod authenticates through the worker node's
+# own EC2 instance profile (infra/tf/modules/autoscaler), same as
+# Alertmanager's SNS publish - so no serviceAccount annotation is needed.
+
+cloudProvider: aws
+
+autoDiscovery:
+  clusterName: ""
+
+extraArgs:
+  # The ASG is found by its k8s.io/cluster-autoscaler/<clusterName>=owned +
+  # k8s.io/cluster-autoscaler/enabled=true tags (infra/tf/modules/k8s-cluster)
+  # instead of a hardcoded --nodes=min:max:asg-name, so asg_min_size/
+  # asg_max_size stay the single source of truth in Terraform.
+  balance-similar-node-groups: true
+  skip-nodes-with-local-storage: false
+  expander: least-waste
+  scale-down-unneeded-time: 10m
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 100m
+    memory: 300Mi

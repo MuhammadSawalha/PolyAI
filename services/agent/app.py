@@ -682,10 +682,14 @@ app.add_middleware(
     allow_origins=["http://localhost:3000",
                    "http://sawalha.dev.fursa.click:3000" ,
                    "http://sawalha.prod.fursa.click:3000",
-                   # k8s frontend is only reachable via manual `kubectl port-forward`
-                   # (no NodePort/Ingress) - dev forwards to localhost:3000 (already
+                   # k8s frontend is still reachable via manual `kubectl port-forward`
+                   # for local debugging - dev forwards to localhost:3000 (already
                    # covered above), prod forwards to localhost:3001. See infra/k8s/README.md.
-                   "http://localhost:3001"],
+                   "http://localhost:3001",
+                   # k8s frontend, exposed to the internet via the ALB + Ingress
+                   # (infra/tf/modules/ingress, infra/k8s/{dev,prod}/frontend/frontend-ingress.yaml).
+                   "https://frontend-dev.sawalha-polyai.fursa.click",
+                   "https://frontend-prod.sawalha-polyai.fursa.click"],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )

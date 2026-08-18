@@ -64,3 +64,32 @@ module "k8s_cluster" {
 
   kubernetes_version = var.kubernetes_version
 }
+
+module "ingress" {
+  source = "./modules/ingress"
+
+  name_prefix       = "sawalha-polyai-${terraform.workspace}"
+  vpc_id            = module.vpc.vpc_id
+  public_subnet_ids = module.vpc.public_subnets
+  worker_asg_name   = module.k8s_cluster.worker_asg_name
+
+  http_node_port    = var.ingress_http_node_port
+  route53_zone_name = var.route53_zone_name
+  domain_name       = var.domain_name
+}
+
+module "monitoring" {
+  source = "./modules/monitoring"
+
+  name_prefix      = "sawalha-polyai-${terraform.workspace}"
+  worker_role_name = module.k8s_cluster.worker_role_name
+  alert_email      = var.alert_email
+}
+
+module "autoscaler" {
+  source = "./modules/autoscaler"
+
+  name_prefix      = "sawalha-polyai-${terraform.workspace}"
+  worker_role_name = module.k8s_cluster.worker_role_name
+  worker_asg_arn   = module.k8s_cluster.worker_asg_arn
+}
