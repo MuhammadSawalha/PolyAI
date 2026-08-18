@@ -15,4 +15,4 @@ kubernetes_version = "1.30"
 # Mailbox that receives cluster alert emails (task7.md Part II step 4) - AWS
 # sends this address an SNS subscription-confirmation link on first apply;
 # alerts don't arrive until it's clicked. Replace with your real inbox.
-alert_email = "REPLACE_ME@example.com"
+alert_email = "swalhamo10@gmail.com"
