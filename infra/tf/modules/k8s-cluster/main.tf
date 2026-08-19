@@ -242,7 +242,7 @@ resource "aws_launch_template" "worker" {
   block_device_mappings {
     device_name = "/dev/sda1"
     ebs {
-      volume_size = 40
+      volume_size = 30
       volume_type = "gp3"
     }
   }
