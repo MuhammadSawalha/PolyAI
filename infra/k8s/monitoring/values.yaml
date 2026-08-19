@@ -70,16 +70,15 @@ grafana:
 
   # sidecar.dashboards is already enabled cluster-wide by this chart's own
   # defaults (label: grafana_dashboard, labelValue: "1", searchNamespace: ALL)
-  # - infra/k8s/monitoring/grafana-dashboard-agent.yaml relies on exactly that.
-  # The NGINX Ingress Controller dashboard (task7.md Part II step 3, grafana.com
-  # id 9614) is pulled straight from grafana.com at pod startup instead of a
-  # second hand-copied ConfigMap:
-  dashboards:
-    default:
-      nginx-ingress:
-        gnetId: 9614
-        revision: 1
-        datasource: Prometheus
+  # - infra/k8s/monitoring/grafana-dashboard-agent.yaml and
+  # grafana-dashboard-nginx-ingress.yaml both rely on exactly that. The
+  # NGINX Ingress Controller dashboard (task7.md Part II step 3, grafana.com
+  # id 9614) is NOT pulled via this chart's own `dashboards.<provider>.gnetId`
+  # mechanism - that downloads into the pod's
+  # /var/lib/grafana/dashboards/default/ via an init container, but this
+  # chart's only configured provisioning provider (from sidecar.dashboards
+  # above) watches /tmp/dashboards instead, so the download is silently never
+  # loaded. See grafana-dashboard-nginx-ingress.yaml for the working fix.
 
 alertmanager:
   config:

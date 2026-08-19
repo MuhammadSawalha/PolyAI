@@ -141,6 +141,7 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
 # The ServiceMonitor/PrometheusRule CRDs these depend on only exist once the
 # chart above has installed them, so these must come after, not before.
 kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-dashboard-agent.yaml"
+kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-dashboard-nginx-ingress.yaml"
 kubectl apply -f "$SCRIPT_DIR/monitoring/ingress-nginx-metrics.yaml"
 kubectl apply -f "$SCRIPT_DIR/monitoring/prometheus-rules.yaml"
 kubectl apply -f "$SCRIPT_DIR/monitoring/grafana-ingress.yaml"
