@@ -171,7 +171,8 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
   --set alertmanager.config.receivers[0].sns_configs[0].topic_arn="$SNS_TOPIC_ARN" \
   --set alertmanager.config.receivers[0].sns_configs[0].sigv4.region="$SNS_TOPIC_REGION"
 
-kubectl apply -f infra/k8s/monitoring/grafana-dashboard-agent.yaml   # sidecar-loaded, no manual import
+kubectl apply -f infra/k8s/monitoring/grafana-dashboard-agent.yaml           # sidecar-loaded, no manual import
+kubectl apply -f infra/k8s/monitoring/grafana-dashboard-nginx-ingress.yaml   # same mechanism, see note below
 kubectl apply -f infra/k8s/monitoring/ingress-nginx-metrics.yaml     # Service + ServiceMonitor for ingress-nginx's own /metrics
 kubectl apply -f infra/k8s/monitoring/prometheus-rules.yaml          # task7.md Part II step 5's two alert rules
 kubectl apply -f infra/k8s/monitoring/grafana-ingress.yaml
@@ -189,11 +190,16 @@ scrapers would just sit permanently `Down` (their default ports are kubeadm's, b
 `127.0.0.1`).
 
 The community [NGINX Ingress Controller dashboard](https://grafana.com/grafana/dashboards/9614-nginx-ingress-controller/)
-(grafana.com id `9614`) is pulled by Grafana itself at pod startup (`grafana.dashboards.default.nginx-ingress.gnetId: 9614`
-in `values.yaml`) - nothing to import by hand. The custom `agent.json` dashboard (same one
-the legacy Docker Compose Grafana uses) is instead committed as a `ConfigMap` labeled
-`grafana_dashboard: "1"`, picked up by the chart's dashboard sidecar
-(`infra/k8s/monitoring/grafana-dashboard-agent.yaml`).
+(grafana.com id `9614`) and the custom `agent.json` dashboard (same one the legacy Docker
+Compose Grafana uses) are both committed as `ConfigMap`s labeled `grafana_dashboard: "1"`,
+picked up by the chart's dashboard sidecar (`infra/k8s/monitoring/grafana-dashboard-agent.yaml`,
+`infra/k8s/monitoring/grafana-dashboard-nginx-ingress.yaml`) - nothing to import by hand.
+(The chart's own `grafana.dashboards.<provider>.gnetId` values mechanism looks like the more
+obvious way to pull `9614` in, and was tried first - it downloads the dashboard into the pod's
+`/var/lib/grafana/dashboards/default/` via an init container, but this chart's only configured
+provisioning provider watches `/tmp/dashboards` instead (fed by `sidecar.dashboards`), so the
+download is silently never loaded. Committing it as a `ConfigMap` sidesteps that mismatch by
+using the one mechanism that's actually wired up.)
 
 ## Step 6 - Apply everything
 
