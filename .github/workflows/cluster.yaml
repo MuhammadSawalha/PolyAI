@@ -199,6 +199,7 @@ jobs:
           host: ${{ needs.provision.outputs.control_plane_ip }}
           username: ubuntu
           key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          command_timeout: 40m
           envs: SNS_TOPIC_ARN,CLUSTER_NAME,AWS_REGION
           script: |
             export SNS_TOPIC_ARN="$SNS_TOPIC_ARN"
