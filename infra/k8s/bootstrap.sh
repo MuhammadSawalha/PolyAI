@@ -75,6 +75,25 @@ kubectl -n ingress-nginx patch svc ingress-nginx-controller -p \
   '{"spec":{"ports":[{"port":80,"nodePort":30080},{"port":443,"nodePort":30443}]}}'
 kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
 
+# --- Namespaces + StorageClass (dev/prod) ---
+# infra/k8s/README.md Step 6 - non-recursive on purpose: dev/ and prod/ each
+# hold only namespace.yaml and storageclass.yaml directly (agent/yolo/frontend
+# now live in their own subfolders and are managed by ArgoCD instead, applied
+# via app-of-apps below). Must happen before kube-prometheus-stack's PVCs
+# (storageClassName: ebs-sc) are created further down.
+kubectl apply -f "$SCRIPT_DIR/dev/"
+kubectl apply -f "$SCRIPT_DIR/prod/"
+
+# --- EBS CSI driver ---
+# infra/k8s/README.md Step 3 - cluster add-on infrastructure, not one of "your
+# services". The worker/control-plane IAM roles already carry
+# AmazonEBSCSIDriverPolicy (infra/tf/modules/k8s-cluster); this installs the
+# actual driver software that uses it. Without it, ebs-sc PVCs (Prometheus,
+# Grafana) stay Pending forever and the kube-prometheus-stack Helm install
+# below times out waiting on them.
+kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.35"
+kubectl -n kube-system rollout status deployment/ebs-csi-controller --timeout=300s
+
 # --- ArgoCD ---
 kubectl get namespace argocd || kubectl create namespace argocd
 kubectl apply -n argocd --server-side --force-conflicts \

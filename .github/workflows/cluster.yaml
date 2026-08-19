@@ -193,6 +193,29 @@ jobs:
           target: "/home/ubuntu/cluster-bootstrap/autoscaler"
           strip_components: 3
 
+      # Only namespace.yaml + storageclass.yaml - everything else in these
+      # folders (agent/, yolo/, frontend/, img-proc-mcp/) is ArgoCD-managed,
+      # applied via app-of-apps instead (infra/k8s/README.md Step 6).
+      - name: Copy dev namespace/storageclass manifests
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/dev/*.yaml"
+          target: "/home/ubuntu/cluster-bootstrap/dev"
+          strip_components: 3
+
+      - name: Copy prod namespace/storageclass manifests
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.control_plane_ip }}
+          username: ubuntu
+          key: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+          source: "infra/k8s/prod/*.yaml"
+          target: "/home/ubuntu/cluster-bootstrap/prod"
+          strip_components: 3
+
       - name: Run bootstrap
         uses: appleboy/ssh-action@v1
         with:
