@@ -156,6 +156,23 @@ resource "aws_iam_instance_profile" "worker" {
   role = aws_iam_role.worker.name
 }
 
+# IAM is eventually consistent - on a fresh apply the role/instance profile
+# above can take a few seconds to propagate. Without this wait,
+# CreateAutoScalingGroup's launch-template authorization check can land in
+# that window and fail with "not authorized to use launch template" even
+# though the permissions are correct.
+resource "time_sleep" "wait_for_worker_iam_propagation" {
+  depends_on = [
+    aws_iam_role_policy_attachment.worker_ebs_csi,
+    aws_iam_role_policy_attachment.worker_s3_images,
+    aws_iam_role_policy_attachment.worker_bedrock,
+    aws_iam_role_policy.worker_ssm_read,
+    aws_iam_instance_profile.worker,
+  ]
+
+  create_duration = "20s"
+}
+
 # --- Worker join-command handoff ---
 # A Terraform-managed placeholder so `destroy` actually removes it - a raw
 # `aws ssm put-parameter` from inside user-data alone would leave this
@@ -247,6 +264,8 @@ resource "aws_launch_template" "worker" {
   lifecycle {
     create_before_destroy = true
   }
+
+  depends_on = [time_sleep.wait_for_worker_iam_propagation]
 }
 
 resource "aws_autoscaling_group" "workers" {
